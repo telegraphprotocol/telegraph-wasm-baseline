@@ -17,7 +17,9 @@
 //! | `alloc` | `(i32) → i32` | Allocate N bytes, return pointer |
 //! | `dealloc` | `(i32, i32)` | Free pointer + size |
 
-#![no_std]
+// `no_std` for the wasm target. Native test builds need std so that the per-file
+// `#[cfg(test)]` unit tests can link against the test harness.
+#![cfg_attr(not(test), no_std)]
 #![allow(clippy::missing_safety_doc)]
 
 extern crate alloc;
