@@ -1,0 +1,10 @@
+# Training and conversion (wide_runtime). Install a CUDA build of torch for GPU training:
+# https://pytorch.org/get-started/locally/
+torch
+transformers>=4.48   # ModernBERT support
+peft
+numpy
+# only for --hf-dataset
+datasets
+# only for --config <file>.yaml
+pyyaml

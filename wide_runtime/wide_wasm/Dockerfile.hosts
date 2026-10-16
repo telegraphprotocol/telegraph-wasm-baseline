@@ -1,0 +1,63 @@
+# syntax=docker/dockerfile:1
+#
+# Reproducible build of the two wide EMBED HOSTS (judgment + hybrid).
+#
+# Driven by build-hosts.sh (which builds twice with --no-cache and requires identical sha256,
+# runs the float-opcode gate, and writes hosts/ + hosts.lock.json). Do not hand-run unless you
+# know why: the bytes this produces are what every per-intent package's keccak256 is computed
+# over, so they must be a pure function of this file + Cargo.lock + src/.
+#
+# Why Docker rather than the developer's cargo: rustc embeds source paths (the cargo registry
+# path of dlmalloc, the workspace path of src/*.rs) in the binary, so the same 1.98.1 toolchain
+# on two machines emits two different hosts. Here every path is fixed (WORKDIR /build,
+# CARGO_HOME /usr/local/cargo) AND remapped (--remap-path-prefix), the base image is pinned by
+# digest, dependencies come from Cargo.lock only (--locked), and the compile itself runs
+# --offline after a separate fetch step.
+#
+# Output (BuildKit local exporter): wide_embed_judgment.wasm, wide_embed_hybrid.wasm.
+
+ARG RUST_IMAGE=rust:1.98.1-slim-bookworm@sha256:ff521445a372125ed4f76e1453a1f8098f2d05332d1601d30db1c1f62757e730
+
+FROM ${RUST_IMAGE} AS build
+
+ENV CARGO_HOME=/usr/local/cargo \
+    RUSTUP_HOME=/usr/local/rustup \
+    CARGO_INCREMENTAL=0 \
+    CARGO_TERM_COLOR=never \
+    SOURCE_DATE_EPOCH=0
+
+# Both prefixes rustc could otherwise leak into the module. Recorded verbatim in hosts.lock.json.
+ARG HOST_RUSTFLAGS="--remap-path-prefix=/build=/wide_wasm --remap-path-prefix=/usr/local/cargo=/cargo"
+
+WORKDIR /build
+
+# Toolchain + target. rust-toolchain.toml pins channel 1.98.1, which is exactly the image's
+# toolchain, so rustup selects it without a download; the wasm32 std is fetched here once.
+COPY rust-toolchain.toml Cargo.toml Cargo.lock ./
+RUN rustup target add wasm32-unknown-unknown --toolchain 1.98.1 \
+ && rustc -Vv && cargo -V
+
+# Dependency fetch (the only networked step besides the target add), independent of src/.
+# Fetches the WHOLE lockfile, not --target-filtered: cargo resolves every locked package even for
+# a wasm32 build, so a filtered fetch leaves the offline compile short of libc.
+RUN mkdir -p src && : > src/lib.rs \
+ && cargo fetch --locked \
+ && rm -rf src
+
+COPY src ./src
+
+# Compile both hosts OFFLINE from the lockfile, each in its own target dir under /build (so the
+# remap covers any path that leaks from it).
+RUN set -eu; \
+    for class in judgment hybrid; do \
+      case "$class" in judgment) feat=embedded ;; hybrid) feat=embedded-hybrid ;; esac; \
+      RUSTFLAGS="$HOST_RUSTFLAGS" cargo build --offline --locked --release \
+        --target wasm32-unknown-unknown --no-default-features --features "$feat" \
+        --target-dir "/build/target-$class"; \
+      mkdir -p /out; \
+      cp "/build/target-$class/wasm32-unknown-unknown/release/wide_wasm.wasm" "/out/wide_embed_$class.wasm"; \
+    done; \
+    sha256sum /out/*.wasm
+
+FROM scratch
+COPY --from=build /out/ /

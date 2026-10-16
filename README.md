@@ -1,91 +1,67 @@
-# Telegraph WASM Scoring Module — Baseline
+# Telegraph Scoring Adapter Kit
 
-Telegraph's production WASM scoring module: the program that judges how good
-a miner's answer is. It embeds `question` / `ground_truth` / `miner_answer`
-with a MiniLM-L6-v2 sentence transformer, compares them with cosine
-similarity, adds a BM25 lexical-overlap signal and a length-quality signal,
-and combines all four into one composite score.
+Everything you need to build a **scoring adapter** for a Telegraph judgment or
+hybrid intent: the model that reads a question and a miner's answer and scores
+how good the answer is. Register a better one than the current adapter and it
+replaces it.
 
-For a minimal, from-scratch example of what a scoring module needs to
-implement (just word-overlap, no embeddings), see the `rust-module/` example
-in the `wasm-scoring-module` examples repo, this is what a real, non-toy
-one looks like once it needs to judge semantic meaning rather than exact
-word overlap.
+Full guide: [Train a Scoring Adapter](https://docs.telegraphprotocol.com/docs/scoring/train-a-scoring-adapter)
 
-```
-telegraph-wasm-baseline/
-├── src/
-│   ├── lib.rs         exports: rank_answer, breakdown_answer,
-│   │                  embed, cosine_sim, bm25_score, alloc, dealloc
-│   ├── embed.rs        MiniLM-L6-v2 inference (two modes, see below)
-│   ├── tokenizer.rs     BERT-style tokenizer feeding embed.rs
-│   ├── bm25.rs          single-document BM25 lexical scorer
-│   ├── math.rs          cosine similarity, sigmoid, L2 norm — pure libm, no host calls
-│   └── allocator.rs     no_std global allocator + panic handler
-├── build.rs             compiles vocab.txt into a binary lookup table (real_weights mode only)
-├── vocab.txt             BERT uncased vocabulary (30,522 tokens)
-├── weights/
-│   └── minilm_l6_v2_q8.bin   INT8-quantized MiniLM-L6-v2 weights
-├── Cargo.toml
-└── Cargo.lock
-```
+## Quick start
 
-Every file above has a module-level doc comment explaining what it does and
-why it's built that way, read the source directly for the details
-(particularly `embed.rs`, which documents the exact MiniLM-L6-v2 graph it
-reimplements and the binary weights format it reads).
-
-## Two build modes
-
-**Projection mode (default)** — no real model weights, no Python. Token IDs
-get hashed into a deterministic pseudo-embedding. Structurally identical
-output shape to real inference (384-dim, L2-normalised), but not
-semantically meaningful (two sentences about the same topic won't
-necessarily score high similarity). Useful for exercising the rest of the
-pipeline fast, not for judging real answer quality.
+From the root of this repository:
 
 ```bash
-rustup target add wasm32-unknown-unknown   # once
-cargo build --release --target wasm32-unknown-unknown
+pip install -r requirements.txt
+
+# 1. train (pairs.jsonl: one {"prompt", "chosen", "rejected"} per line; GPU recommended)
+python -m wide_runtime.train_adapter --intent CODE_REVIEW --data pairs.jsonl --out runs/CODE_REVIEW
+
+# 2. convert to the node's Q32.32 fixed-point format (~1.2 GB)
+python -m wide_runtime.convert_adapter --base answerdotai/ModernBERT-base \
+  --adapter runs/CODE_REVIEW/adapter --out runs/CODE_REVIEW/CODE_REVIEW.imwq
+
+# 3. package into the one .wasm you register; prints its keccak256
+go run ./cmd/adapterbuild --intent CODE_REVIEW \
+  --imwq runs/CODE_REVIEW/CODE_REVIEW.imwq --out runs/CODE_REVIEW
 ```
 
-**Real weights mode** — runs actual MiniLM-L6-v2 inference (6-layer
-transformer, INT8-quantized) using the weights already included in
-`weights/minilm_l6_v2_q8.bin`, so this builds out of the box with no extra
-export step:
+Then host `runs/CODE_REVIEW/CODE_REVIEW.wasm` at an `https://` or `ipfs://` URL
+and call `registerWasm(keccak256, url, "CODE_REVIEW", feeAddress)`. See
+[Build a Scoring Module](https://docs.telegraphprotocol.com/docs/scoring/build-a-scoring-module)
+for registering and how the competition works.
 
-```bash
-cargo build --release --target wasm32-unknown-unknown --features real_weights
-```
+Check your data before spending GPU time:
+`python -m wide_runtime.train_adapter --intent CODE_REVIEW --data pairs.jsonl --check-data`
 
-Output either way: `target/wasm32-unknown-unknown/release/telegraph_scoring.wasm`
+**Needs:** Python 3.10+, Go 1.25+, and a GPU for training.
 
-## Testing it
+## What's in here
 
-Load the built `.wasm` with any [wazero](https://wazero.io)-based host and
-call `rank_answer` (write `question`/`ground_truth`/`miner_answer` into the
-module's memory via its own `alloc`, then call it), the same way Telegraph's
-own validator does. The `go-tester` CLI in the `wasm-scoring-module`
-examples repo is a small standalone tool that does exactly this if you want
-something ready-made.
+| Path | What |
+|---|---|
+| `wide_runtime/train_adapter.py` | Trains a ModernBERT LoRA reward model from preference pairs, behind a dataset gate and an evaluation gate |
+| `wide_runtime/convert_adapter.py`, `convert.py`, `format.py` | Converts the trained adapter to a Q32.32 `.imwq` model |
+| `wide_runtime/golden/`, `interp.py` | The Python reference for the fixed-point math |
+| `wide_runtime/wide_wasm/` | The Rust interpreter that runs the model inside WebAssembly |
+| `wide_runtime/wide_wasm/hosts/` | The two pinned interpreter builds every package is made from, and their lock file |
+| `cmd/adapterbuild` | Packages one `.imwq` into the registrable `.wasm` |
+| `pkg/` | The Go code `adapterbuild` uses, including copies of the Telegraph node's own loader, so a package is checked exactly as a node will load it |
+| `wide_runtime/README.md` | Technical reference: the `.imwq` format, the WASM ABI, how packages and hosts are built |
+| `legacy/v1-minilm/` | The retired V1 MiniLM `rank_answer` module. Nodes no longer accept it. Kept for reference only |
 
-Each source file also has its own `#[cfg(test)]` module with unit tests for
-that file's logic (cosine/sigmoid edge cases in `math.rs`, BM25 scoring in
-`bm25.rs`, tokenizer padding/truncation in `tokenizer.rs`, embedding
-determinism in `embed.rs`). `cargo test` does not currently run them,
-`#[panic_handler]` in `allocator.rs` is unconditional and collides with
-`std`'s own panic handler when compiling for the native test target instead
-of `wasm32-unknown-unknown`. Gating that handler behind `#[cfg(not(test))]`
-would fix it. Read the tests directly in each file's bottom section in the
-meantime.
+## Same result as the node
 
-## Exports beyond the minimal three
+A package's keccak256 is what you register, and validators check it against the
+bytes they download. Packaging is a pure function of the pinned host, your
+`.imwq` and the intent's class, so anyone with the same `.imwq` gets the same
+hash. `adapterbuild` builds every package twice, requires identical bytes, and
+loads the result with the node's own loader before writing it.
 
-A minimal scoring module only needs `alloc` / `dealloc` / `rank_answer`.
-This module also exports:
+The code under `pkg/wasm/runtime` and `pkg/scoring` is copied from the
+[Telegraph node](https://github.com/telegraphprotocol/Telegraph), unchanged apart
+from import paths. When the node's copy changes, copy it here again.
 
-- `breakdown_answer` — returns the four individual signals (relevance,
-  correctness, lexical, length) plus the composite, for debugging why a
-  score came out the way it did instead of just the final number.
-- `embed` / `cosine_sim` / `bm25_score` — the individual building blocks,
-  exposed standalone so callers/tests can exercise one signal in isolation.
+## License
+
+MIT. See [LICENSE](LICENSE).

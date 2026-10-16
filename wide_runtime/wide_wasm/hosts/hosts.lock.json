@@ -1,0 +1,12 @@
+{
+  "schema": 1,
+  "builder": "pipelines/wide_runtime/wide_wasm/build-hosts.sh",
+  "toolchain": "1.98.1",
+  "image": "rust:1.98.1-slim-bookworm@sha256:ff521445a372125ed4f76e1453a1f8098f2d05332d1601d30db1c1f62757e730",
+  "image_digest": "sha256:ff521445a372125ed4f76e1453a1f8098f2d05332d1601d30db1c1f62757e730",
+  "rustflags": "--remap-path-prefix=/build=/wide_wasm --remap-path-prefix=/usr/local/cargo=/cargo",
+  "cargo_lock_sha256": "87a15df57f46c9baa9fbe8a76ac9efb0dc514b18f15802fb81053d0c8ac1af33",
+  "src_sha256": "ebb85c7f656c8d287403c46fea6faca1a2865c798c5dc239352358e67ec1bd64",
+  "judgment": {"file": "wide_embed_judgment.wasm", "features": "embedded", "sha256": "d27863825b9b11396b03c2f9b69202af266a6e7424f9c297b70964fc4940ed51", "size": 49331},
+  "hybrid": {"file": "wide_embed_hybrid.wasm", "features": "embedded-hybrid", "sha256": "1e661dc47b8d9f2b3640c5301fcb9620a1bb5c5936af4cccbd8dac37a88f6d4b", "size": 51710}
+}
