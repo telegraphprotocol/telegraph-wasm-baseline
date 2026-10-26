@@ -1,0 +1,9 @@
+# Wasm modules are binary: never touch their bytes (the pinned embed hosts are
+# verified by sha256 against hosts.lock.json).
+*.wasm binary
+
+# The embed-host build inputs must check out byte-identical on every OS, or the
+# reproducible Docker build (build-hosts.sh) hashes different sources.
+wide_runtime/wide_wasm/** text=auto eol=lf
+wide_runtime/wide_wasm/**/*.wasm binary
+wide_runtime/wide_wasm/**/*.imwq binary

@@ -1,1 +1,9 @@
 /target
+# Rust build output
+/wide_runtime/wide_wasm/target/
+/legacy/v1-minilm/target/
+# training / conversion / packaging output (each .imwq and package is ~1.2 GB)
+/runs/
+# Python
+__pycache__/
+*.pyc

@@ -1,0 +1,39 @@
+[package]
+name    = "wide-wasm"
+version = "0.1.0"
+edition = "2021"
+
+# ── Build target ──────────────────────────────────────────────────────────────
+# cargo build --target wasm32-unknown-unknown --release
+# Output: target/wasm32-unknown-unknown/release/wide_wasm.wasm (~52 KB — an INTERPRETER,
+# not the model; the ~1.2 GB .imwq artifact is passed in at call time, or embedded into a
+# per-intent package by cmd/wideembed from an embed-host build — see [features].)
+[lib]
+crate-type = ["cdylib", "rlib"]   # cdylib for wasm; rlib so native golden-diff tests can link it
+
+# ── Features ──────────────────────────────────────────────────────────────────
+# The DEFAULT build enables none of these and must stay byte-identical to the shared ~52 KB
+# interpreter/comparator binary (imwq_score + imwq_score_hybrid + imw_score_deterministic).
+# Deliberately no `default = [...]`: cargo hashes the ENABLED feature set into -C metadata,
+# which changes every mangled symbol in the name section, so even a default-on feature that
+# gates nothing would move the shared binary's hash.
+#
+# The two EMBED HOSTS are built once, pinned, and handed to cmd/wideembed, which injects one
+# intent's .imwq as an appended active data segment ("one self-contained wasm per intent"):
+#   judgment: cargo build --target wasm32-unknown-unknown --release --features embedded
+#   hybrid:   cargo build --target wasm32-unknown-unknown --release --features embedded-hybrid
+# An embed host exports imwq_embedded()/imwq_embed_desc_addr() and NOT imw_score_deterministic,
+# so a self-contained package can never be mistaken for the comparator module.
+[features]
+embedded        = []             # embed slot + imwq_embedded; drops hybrid + deterministic exports
+embedded-hybrid = ["embedded"]   # as `embedded`, but keeps imwq_score_hybrid (hybrid intents)
+
+[dependencies]
+# no_std allocator for wasm32. NO float-math dep (libm): the forward pass is integer-only
+# Q32.32 (any f32/f64 opcode in the module is a build failure — see build_gates.py). Rust has
+# native i128 so the int128 intermediates in fp_mul need no external crate.
+dlmalloc = { version = "0.2", features = ["global"] }
+
+[profile.release]
+panic = "abort"
+opt-level = 3

@@ -1,0 +1,9 @@
+# Pinned toolchain. The embed hosts (`--features embedded` / `embedded-hybrid`) are packaged by
+# cmd/wideembed into one self-contained wasm per intent, and that package's keccak256 is what
+# gets registered on-chain — so the host bytes must be rebuildable bit-for-bit. A different
+# compiler emits different bytes. Bump deliberately, never incidentally (same rule as the int8
+# crate's pin). NOTE: the toolchain alone is not sufficient — rustc also embeds source paths
+# (registry + workspace) into the binary; see wide_runtime/README.md, "Embed hosts".
+[toolchain]
+channel  = "1.98.1"
+targets  = ["wasm32-unknown-unknown"]
