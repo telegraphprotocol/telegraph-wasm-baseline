@@ -4,6 +4,8 @@ torch
 transformers>=4.48   # ModernBERT support
 peft
 numpy
+onnx>=1.17
+huggingface_hub>=0.27
 # only for --hf-dataset
 datasets
 # only for --config <file>.yaml

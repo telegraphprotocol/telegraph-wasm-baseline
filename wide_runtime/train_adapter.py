@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """Train a scoring adapter for a judgment or hybrid intent.
 
-The first step of the wide adapter pipeline. It fine-tunes a LoRA Bradley-Terry
+The first step of the V2 adapter pipeline. It fine-tunes a LoRA Bradley-Terry
 reward model on ModernBERT-base from preference pairs (a prompt, a better answer,
 a worse answer) and writes the adapter to disk. The other steps:
 
     1. train      python -m wide_runtime.train_adapter --intent X --data pairs.jsonl --out runs/X
-    2. convert    python -m wide_runtime.convert_adapter --base answerdotai/ModernBERT-base \
-                      --adapter runs/X/adapter --out runs/X/X.imwq
-    3. package    go run ./cmd/adapterbuild --intent X --imwq runs/X/X.imwq --out runs/X
-    4. register   registerWasm(keccak256, url, "X", feeAddress) with the .wasm from step 3
+    2. export     python -m wide_runtime.export_onnx --base answerdotai/ModernBERT-base \
+                      --adapter runs/X/adapter --out runs/X/model.onnx
+    3. bake       wide_runtime/vm_float_wasm/bake_wasm.sh runs/X/model.onnx runs/X/model.baked.wasm
+    4. package    go run ./cmd/adapterbuild --intent X --baked-wasm runs/X/model.baked.wasm --out runs/X
 
 Run every step from the root of this repository.
 
@@ -33,9 +33,9 @@ What the node fixes, and so this script fixes
   The base model's tokenizer is checked against the node's conformance vectors.
 - Input text: "### Task:\\n<prompt>\\n\\n### Answer:\\n<answer>", the node's
   RenderForJudgment. Training on any other template teaches a different task.
-- Length: the node scores the first 256 tokens (tokenizer.DefaultMaxLen). Training
+- Length: the node scores up to 512 tokens. Training
   on longer inputs teaches the model to use text it will never see at scoring time,
-  so --max-length defaults to 256.
+  so --max-length defaults to 512.
 
 Two gates
 ---------
@@ -80,7 +80,7 @@ logging.basicConfig(
 log = logging.getLogger("train_adapter")
 
 DEFAULT_BASE = "answerdotai/ModernBERT-base"
-NODE_MAX_LEN = 256  # the node's tokenizer.DefaultMaxLen
+NODE_MAX_LEN = 512  # V2 float adapter token cap
 
 # The node's tokenizer conformance vectors (Telegraph pkg/wasm/tokenizer/testdata).
 TOKENIZER_VECTORS = Path(__file__).resolve().parent / "testdata" / "tokenizer_vectors.json"
@@ -640,7 +640,7 @@ def build_argparser() -> argparse.ArgumentParser:
     hp = Hyperparams()
     p = argparse.ArgumentParser(
         description="Train a ModernBERT LoRA reward-model adapter for a judgment or hybrid "
-                    "intent. Convert the result with wide_runtime.convert_adapter.",
+                    "intent. Export the result with wide_runtime.export_onnx.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--intent", required=True, help="intent the adapter scores, e.g. CODE_REVIEW")
@@ -669,7 +669,7 @@ def build_argparser() -> argparse.ArgumentParser:
 
     g = p.add_argument_group("hyperparameters")
     for name, typ, help_ in [
-        ("max_length", int, "tokens per answer; the node scores 256"),
+        ("max_length", int, "tokens per answer; the node scores at most 512"),
         ("batch_size", int, None), ("grad_accum", int, None),
         ("lora_rank", int, None), ("lora_alpha", int, None), ("lora_dropout", float, None),
         ("epochs", int, None), ("lr", float, None), ("weight_decay", float, None),
@@ -784,11 +784,13 @@ def main(argv=None) -> int:
     if result["verdict"] != "PASS":
         log.error("evaluation gate FAILED: %s", result.get("fail_reason", ""))
         return 1
-    imwq = out / f"{args.intent}.imwq"
+    onnx = out / "model.onnx"
+    baked = out / "model.baked.wasm"
     print("\nNext:\n"
-          f"  python -m wide_runtime.convert_adapter "
-          f"--base {args.base_model} --adapter {adapter_dir} --out {imwq}\n"
-          f"  go run ./cmd/adapterbuild --intent {args.intent} --imwq {imwq} --out {out}")
+          f"  python -m wide_runtime.export_onnx "
+          f"--base {args.base_model} --adapter {adapter_dir} --out {onnx}\n"
+          f"  wide_runtime/vm_float_wasm/bake_wasm.sh {onnx} {baked}\n"
+          f"  go run ./cmd/adapterbuild --intent {args.intent} --baked-wasm {baked} --out {out}")
     return 0
 
 

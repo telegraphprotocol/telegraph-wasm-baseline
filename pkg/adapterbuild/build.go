@@ -1,15 +1,17 @@
-// Package adapterbuild is the automated packaging step for wide Q32.32 adapters:
-// it turns an intent's converted .imwq into the ONE self-contained .wasm that is
-// registered on-chain for that intent, and (optionally) publishes it to the
-// S3-compatible object store the node fetches from.
+// Package adapterbuild packages Telegraph scoring adapters. The V2 path adds
+// ABI-v2 metadata to a baked ONNX/WASI module. The retained Q32.32 path turns
+// an .imwq model into one self-contained legacy wasm package. Both paths can
+// publish a verified artifact to the configured S3-compatible object store.
 //
-//	Build:   catalog class -> pinned embed host (sha256 in hosts.lock.json)
-//	         -> wideembed.Package TWICE (byte-identical or fail) -> verified load
+//	V2:      baked ONNX/WASI module -> ABI-v2 metadata -> compile check
 //	         -> <out>/<INTENT>.wasm + <INTENT>.wasm.manifest.json
+//	Legacy:  catalog class -> pinned embed host -> wideembed.Package TWICE
+//	         -> verified self-contained Q32.32 package
 //	Publish: wasm/<INTENT>/<INTENT>.wasm (+ .manifest.json), refusing to overwrite
 //	         different bytes at that key unless explicitly told to.
 //
-// Registration (registerWasm with the returned URL + keccak256) stays manual.
+// Publishing does not activate an adapter; submission to the V2 registration
+// flow and its node-side validation remain separate.
 //
 // Every failure is loud: a host not in the lock, a class that disagrees with the
 // catalog, a deterministic intent, a non-reproducible package, a failed verify,
@@ -78,13 +80,14 @@ type Provenance struct {
 
 // Req is one build.
 type Req struct {
-	Intent     string
-	IMWQPath   string
-	Class      string // optional; must agree with the catalog when set
-	Provenance Provenance
-	OutDir     string // default "."
-	HostsDir   string // default: FindHostsDir("")
-	MaxTokens  int    // default wideembed.DefaultMaxTokens
+	Intent        string
+	IMWQPath      string
+	BakedWasmPath string
+	Class         string // optional; must agree with the catalog when set
+	Provenance    Provenance
+	OutDir        string // default "."
+	HostsDir      string // default: FindHostsDir("")
+	MaxTokens     int    // default wideembed.DefaultMaxTokens
 	// LimitBytes overrides the 4 GiB budget ceiling (tests only).
 	LimitBytes uint64
 	// Training, when set, is embedded in the package's telegraph.adapter
@@ -126,6 +129,8 @@ type Manifest struct {
 	Intent         string `json:"intent"`
 	wideembed.Manifest
 	IMWQFile        string          `json:"imwq_file"`
+	Runtime         string          `json:"runtime,omitempty"`
+	BakedWasmFile   string          `json:"baked_wasm_file,omitempty"`
 	Provenance      Provenance      `json:"provenance"`
 	HostsLock       HostsLockRef    `json:"hosts_lock"`
 	Reproducibility Reproducibility `json:"reproducibility"`
@@ -317,6 +322,27 @@ func LoadArtifact(path, intent, hostsDir string) (Artifact, Manifest, error) {
 	if err != nil {
 		return Artifact{}, man, err
 	}
+	if man.Runtime == wasmrt.AdapterRuntimeONNXF32 {
+		b, err := os.ReadFile(path)
+		if err != nil {
+			return Artifact{}, man, fmt.Errorf("adapterbuild: reading float artifact: %w", err)
+		}
+		meta, err := wasmrt.ReadAdapterMeta(b)
+		if err != nil {
+			return Artifact{}, man, err
+		}
+		if meta == nil || meta.ABIVersion != wasmrt.FloatAdapterABIVersion || meta.Runtime != wasmrt.AdapterRuntimeONNXF32 || meta.Class != string(class) {
+			return Artifact{}, man, fmt.Errorf("adapterbuild: float artifact metadata does not match its manifest")
+		}
+		sha, n, err := sha256File(path)
+		if err != nil {
+			return Artifact{}, man, err
+		}
+		if sha != man.BundleSHA256 || n != int64(man.BundleBytes) {
+			return Artifact{}, man, fmt.Errorf("adapterbuild: %s is sha256 %s (%d B) but its manifest says %s (%d B)", path, sha, n, man.BundleSHA256, man.BundleBytes)
+		}
+		return Artifact{Path: path, ManifestPath: manPath, SHA256: sha, Keccak256: man.BundleKeccak256, Bytes: n}, man, nil
+	}
 	dir, err := FindHostsDir(hostsDir)
 	if err != nil {
 		return Artifact{}, man, err
@@ -340,6 +366,14 @@ func LoadArtifact(path, intent, hostsDir string) (Artifact, Manifest, error) {
 	// keccak256 needs the bytes; the sha256 match above already binds them to the
 	// manifest, whose keccak was computed over the same bytes at build time.
 	return Artifact{Path: path, ManifestPath: manPath, SHA256: sha, Keccak256: man.BundleKeccak256, Bytes: n}, man, nil
+}
+
+func jsonMarshalIndent(v any) ([]byte, error) {
+	b, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		return nil, fmt.Errorf("adapterbuild: encoding manifest: %w", err)
+	}
+	return append(b, '\n'), nil
 }
 
 func sha256File(path string) (string, int64, error) {
