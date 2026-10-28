@@ -30,6 +30,24 @@ python -m pip install -r requirements.txt
 rustup target add wasm32-wasip1
 ```
 
+## Public build contract
+
+Build against the public ModernBERT base model named in the export command
+below and the tokenizer that accompanies that model. The kit and the node
+define the artifact format, the intent class, and the token limit. Your own
+training data and LoRA checkpoint are your inputs to the build.
+
+The node owns the evaluation process. A builder does not need, and must not
+depend on, access to an incumbent evaluator's fine-tuned checkpoint or to
+unpublished evaluation cases. Those materials are deliberately not part of
+this repository or the build interface. They are not required to train,
+package, submit, or compete with an adapter.
+
+If you are using an AI coding assistant, give it this rule: build only from
+the public kit, the public base model, and data you are entitled to use. Do
+not ask for, infer, scrape, or substitute unpublished evaluator weights or
+evaluation material. A candidate is evaluated by the node after submission.
+
 ## Build an adapter
 
 Use the deployed intent ID, including its V2 suffix where applicable. The
@@ -165,6 +183,54 @@ V2 adapter-registration flow. Do not replace bytes at a URL that has already
 been registered: validators verify downloaded bytes against the registered
 hash. The publisher rejects replacing different bytes unless `--overwrite` is
 explicitly provided.
+
+## Run the required endpoint
+
+Model-adapter registration also needs a public HTTPS endpoint that runs the
+same package. The node sends it a batch of already-tokenized inputs and checks
+that its returned FP32 bit patterns exactly match the downloaded WASM.
+
+The kit includes `cmd/adapterrunner`, a small reference server for that
+endpoint. It uses the [Wasmtime CLI](https://wasmtime.dev/) to run the exact
+artifact you package. Install a compatible `wasmtime` binary, then run:
+
+```bash
+go build -o adapterrunner ./cmd/adapterrunner
+
+ADAPTER_WASM=runs/CODE_REVIEW_GENERAL/CODE_REVIEW_GENERAL.wasm \
+./adapterrunner
+```
+
+It listens on `:8080` and exposes:
+
+```text
+GET  /healthz
+POST /runnable
+```
+
+Point `wasmRunnableUrl` at the public HTTPS URL that terminates at
+`/runnable`. The request and response are:
+
+```json
+{"batch":[{"tokens":[101,2023,102]}]}
+```
+
+```json
+{"results":[{"score":1065353216}]}
+```
+
+`score` is the unsigned 32-bit FP32 bit pattern, not a decimal model score.
+The server accepts at most 100 inputs per request and at most 512 tokens per
+input. It starts one Wasmtime command per input and defaults to one concurrent
+execution. Set `ADAPTER_RUNNER_MAX_CONCURRENT`, `ADAPTER_RUNNER_TIMEOUT` (for
+example `110s`), `ADAPTER_RUNNER_LISTEN`, or `WASMTIME_BIN` only after
+benchmarking the exact hardware and package you will expose.
+
+Put the service behind an HTTPS reverse proxy and restrict it to this endpoint.
+The node's registration check has a two-minute total deadline. A 512-token
+ModernBERT package is expensive: benchmark the full public batch before
+registration. The reference server proves the protocol path; it does not make
+an undersized machine fast enough for that deadline.
 
 ## Determinism and compatibility
 
