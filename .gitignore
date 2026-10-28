@@ -1,6 +1,7 @@
 /target
 # Rust build output
 /wide_runtime/wide_wasm/target/
+/wide_runtime/vm_float_wasm/target/
 /legacy/v1-minilm/target/
 # training / conversion / packaging output (each .imwq and package is ~1.2 GB)
 /runs/

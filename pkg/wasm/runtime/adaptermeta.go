@@ -22,11 +22,21 @@ const AdapterMetaSection = "telegraph.adapter"
 // incompatible change to the exports or their argument layout.
 const AdapterABIVersion = 1
 
+// FloatAdapterABIVersion and AdapterRuntimeONNXF32 are the current Telegraph
+// node contract for model-in-WASM adapters. AdapterABIVersion remains 1 for
+// the retired Q32.32 code in this repository so old artifacts stay readable.
+const (
+	FloatAdapterABIVersion = 2
+	AdapterRuntimeONNXF32  = "onnx_f32"
+)
+
 // AdapterMeta is the JSON payload of the AdapterMetaSection.
 type AdapterMeta struct {
 	ABIVersion int    `json:"abi_version"`
 	Class      string `json:"class,omitempty"` // "judgment" | "hybrid" | "comparator"
 	Tool       string `json:"tool,omitempty"`  // builder that wrote the section, informational
+	Runtime    string `json:"runtime,omitempty"`
+	MaxTokens  int    `json:"max_tokens,omitempty"`
 	// Training is the optional, SELF-REPORTED training record our own builds
 	// embed (cmd/adapterbuild --training-record). The node only checks that it
 	// is well-formed and never uses it to decide anything (promotion, ranking):
@@ -159,7 +169,11 @@ func ReadAdapterMeta(b []byte) (*AdapterMeta, error) {
 // wantClass, when non-empty, is the class the module's exports say it is. A
 // training record, when present, is checked for shape only.
 func (m AdapterMeta) Check(wantClass string) error {
-	if m.ABIVersion != AdapterABIVersion {
+	if m.Runtime == AdapterRuntimeONNXF32 {
+		if m.ABIVersion != FloatAdapterABIVersion {
+			return fmt.Errorf("built for float adapter ABI version %d, this node implements version %d", m.ABIVersion, FloatAdapterABIVersion)
+		}
+	} else if m.ABIVersion != AdapterABIVersion {
 		return fmt.Errorf("built for scoring ABI version %d, this node implements version %d", m.ABIVersion, AdapterABIVersion)
 	}
 	if wantClass != "" && m.Class != "" && m.Class != wantClass {

@@ -17,6 +17,7 @@ torch/transformers are imported lazily inside the functions that need them, so `
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 
@@ -103,9 +104,10 @@ def _resolve_adapter(adapter: str) -> tuple[str, str | None]:
         repo_id = "/".join(parts[:2])
         subfolder = "/".join(parts[2:])
         from huggingface_hub import snapshot_download
+        cache_root = Path(os.environ.get("TELEGRAPH_ADAPTER_CACHE", Path.home() / ".cache"))
         root = snapshot_download(
             repo_id,
-            local_dir=str(Path.home() / ".cache" / ("imw_adapters_" + repo_id.replace("/", "_"))))
+            local_dir=str(cache_root / ("telegraph_adapters_" + repo_id.replace("/", "_"))))
         local = str(Path(root) / subfolder) if subfolder else root
         if not (Path(local) / "adapter_config.json").exists():
             raise FileNotFoundError(

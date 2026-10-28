@@ -1,5 +1,7 @@
 package catalog
 
+import "strings"
+
 // compiledHybrid is the Hybrid ("comparator + adapter") subset of the
 // compiled-in judgmentOrHybrid map, from the same final classification
 // (intent-catalog-final-classification.md). Everything in judgmentOrHybrid that
@@ -40,6 +42,13 @@ var compiledHybrid = map[string]struct{}{
 // the catalog at all) return ("", false): the compiled-in data does not list
 // deterministic intents, so callers must not read absence as "deterministic".
 func CompiledClassOf(intentID string) (Class, bool) {
+	// The live V2 catalog uses *_GENERAL IDs for the migrated broad intents.
+	// Offline adapter builds must resolve those IDs to the same declared class
+	// as their original intent. This does not override a class loaded from a
+	// node's intent_classes table.
+	if strings.HasSuffix(intentID, "_GENERAL") {
+		intentID = strings.TrimSuffix(intentID, "_GENERAL")
+	}
 	if _, ok := judgmentOrHybrid[intentID]; !ok {
 		return "", false
 	}

@@ -1,18 +1,19 @@
-// Command adapterbuild is the automated packaging (and optional publishing)
-// step for a wide Q32.32 adapter: one intent's .imwq in, that intent's ONE
-// self-contained registered .wasm out.
+// Command adapterbuild packages and optionally publishes a Telegraph scoring
+// adapter. The supported V2 path takes an ONNX model already baked into a WASI
+// command and produces one ABI-v2 float adapter per intent. The --imwq path is
+// retained for the retired Q32.32 format.
 //
 //	go build -o adapterbuild ./cmd/adapterbuild
 //
 //	# build only: <out>/<INTENT>.wasm + <INTENT>.wasm.manifest.json
-//	adapterbuild --intent VULNERABILITY_TRIAGE --imwq local/builds/wide/VULNERABILITY_TRIAGE.imwq \
-//	  --out local/builds/wide [--class hybrid] [--adapter ... --base-model ... --backbone-version ...]
+//	adapterbuild --intent CODE_REVIEW_GENERAL --baked-wasm runs/CODE_REVIEW_GENERAL/model.baked.wasm \
+//	  --out runs/CODE_REVIEW_GENERAL [--class judgment] [--adapter ... --base-model ...]
 //
 //	# build + publish to wasm/<INTENT>/<INTENT>.wasm (OBJECT_STORE_* env)
-//	adapterbuild --intent VULNERABILITY_TRIAGE --imwq ... --out ... --publish [--overwrite]
+//	adapterbuild --intent CODE_REVIEW_GENERAL --baked-wasm ... --out ... --publish [--overwrite]
 //
 //	# publish an already-built artifact (re-hashed against its manifest + the host lock)
-//	adapterbuild --intent VULNERABILITY_TRIAGE --artifact runs/VULNERABILITY_TRIAGE/VULNERABILITY_TRIAGE.wasm --publish
+//	adapterbuild --intent CODE_REVIEW_GENERAL --artifact runs/CODE_REVIEW_GENERAL/CODE_REVIEW_GENERAL.wasm --publish
 //
 //	# a family build carrying its training record (our builds; see scoring-adapter-standard.md §9)
 //	adapterbuild --intent WEATHER --imwq ... --out ... --training-record runs/WEATHER/training.json \
@@ -26,9 +27,9 @@
 // Nodes never act on the record; it is a check on our own builds only.
 //
 // The class comes from the intent catalog (an explicit --class must agree);
-// deterministic intents are refused. The host is the committed pinned host for
-// that class, checked against wide_runtime/wide_wasm/hosts/hosts.lock.json.
-// The package is built twice and must be byte-identical.
+// deterministic intents are refused. V2 builds validate the supplied WASI
+// command and add metadata. Legacy builds use a pinned embed host and are
+// packaged twice for byte identity.
 //
 // stdout carries exactly one JSON object on success:
 //
@@ -37,7 +38,7 @@
 // (manifest.training echoes the training record when one was embedded.)
 //
 // Human logs go to stderr. Any failure — including a publish failure — exits
-// non-zero with nothing on stdout. registerWasm (URL + keccak256) stays manual.
+// non-zero with nothing on stdout. Publishing does not activate an adapter.
 //
 // Publishing reads OBJECT_STORE_ENDPOINT, OBJECT_STORE_BUCKET,
 // OBJECT_STORE_ACCESS_KEY, OBJECT_STORE_SECRET_KEY, OBJECT_STORE_PUBLIC_BASE_URL
@@ -90,6 +91,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 	intent := fs.String("intent", "", "intent ID (required), e.g. VULNERABILITY_TRIAGE")
 	imwq := fs.String("imwq", "", "the intent's converted .imwq (build mode)")
+	bakedWasm := fs.String("baked-wasm", "", "an ONNX model baked into a WASI command (ABI-v2 float build mode)")
 	artifact := fs.String("artifact", "", "an already-built <INTENT>.wasm to publish (publish-only mode; needs --publish)")
 	class := fs.String("class", "", "judgment | hybrid (optional; must agree with the intent catalog)")
 	out := fs.String("out", ".", "output directory for <INTENT>.wasm + manifest")
@@ -116,8 +118,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 	switch {
 	case *intent == "":
 		return fail(errors.New("--intent is required"))
-	case (*imwq == "") == (*artifact == ""):
-		return fail(errors.New("exactly one of --imwq (build) or --artifact (publish an existing build) is required"))
+	case boolCount(*imwq != "", *bakedWasm != "", *artifact != "") != 1:
+		return fail(errors.New("exactly one of --imwq, --baked-wasm, or --artifact is required"))
 	case *artifact != "" && !*publish:
 		return fail(errors.New("--artifact is the publish-only mode; it needs --publish"))
 	case *overwrite && !*publish:
@@ -145,18 +147,23 @@ func run(args []string, stdout, stderr io.Writer) int {
 		err error
 	)
 	start := time.Now()
-	if *imwq != "" {
+	if *imwq != "" || *bakedWasm != "" {
 		var rec *wasmrt.TrainingRecord
 		if *trainingRecord != "" {
 			if rec, err = adapterbuild.LoadTrainingRecord(*trainingRecord); err != nil {
 				return fail(err)
 			}
 		}
-		art, man, err = adapterbuild.Build(ctx, adapterbuild.Req{
-			Intent: *intent, IMWQPath: *imwq, Class: *class, Provenance: prov,
+		req := adapterbuild.Req{
+			Intent: *intent, IMWQPath: *imwq, BakedWasmPath: *bakedWasm, Class: *class, Provenance: prov,
 			OutDir: *out, HostsDir: *hostsDir, MaxTokens: *maxTokens, LimitBytes: *limitBytes,
 			Training: rec, RequireTraining: *requireTraining, Families: splitList(*families),
-		}, logf)
+		}
+		if *bakedWasm != "" {
+			art, man, err = adapterbuild.BuildFloat(ctx, req, logf)
+		} else {
+			art, man, err = adapterbuild.Build(ctx, req, logf)
+		}
 		if err != nil {
 			return fail(err)
 		}
@@ -190,6 +197,16 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 	fmt.Fprintln(stdout, string(b))
 	return 0
+}
+
+func boolCount(vs ...bool) int {
+	n := 0
+	for _, v := range vs {
+		if v {
+			n++
+		}
+	}
+	return n
 }
 
 // splitList parses a comma-separated flag value, dropping blanks.

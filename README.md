@@ -1,66 +1,193 @@
-# Telegraph Scoring Adapter Kit
+# Telegraph scoring adapter kit
 
-Everything you need to build a **scoring adapter** for a Telegraph judgment or
-hybrid intent: the model that reads a question and a miner's answer and scores
-how good the answer is. Register a better one than the current adapter and it
-replaces it.
+This repository builds a V2 scoring adapter for a Telegraph `judgment` or
+`hybrid` intent. An adapter receives the canonical rendered question and a
+miner answer from the node, then returns one model score. It is a candidate
+until the node has structurally validated it, run its smoke score, and passed
+it through the intent's evaluation material.
 
-Full guide: [Train a Scoring Adapter](https://docs.telegraphprotocol.com/docs/scoring/train-a-scoring-adapter)
+The current format is an ONNX FP32 ModernBERT reward model baked into a
+restricted WASI WebAssembly command. It is identified by this metadata:
 
-## Quick start
-
-From the root of this repository:
-
-```bash
-pip install -r requirements.txt
-
-# 1. train (pairs.jsonl: one {"prompt", "chosen", "rejected"} per line; GPU recommended)
-python -m wide_runtime.train_adapter --intent CODE_REVIEW --data pairs.jsonl --out runs/CODE_REVIEW
-
-# 2. convert to the node's Q32.32 fixed-point format (~1.2 GB)
-python -m wide_runtime.convert_adapter --base answerdotai/ModernBERT-base \
-  --adapter runs/CODE_REVIEW/adapter --out runs/CODE_REVIEW/CODE_REVIEW.imwq
-
-# 3. package into the one .wasm you register; prints its keccak256
-go run ./cmd/adapterbuild --intent CODE_REVIEW \
-  --imwq runs/CODE_REVIEW/CODE_REVIEW.imwq --out runs/CODE_REVIEW
+```json
+{"abi_version":2,"runtime":"onnx_f32","class":"judgment","max_tokens":512}
 ```
 
-Then host `runs/CODE_REVIEW/CODE_REVIEW.wasm` at an `https://` or `ipfs://` URL
-and call `registerWasm(keccak256, url, "CODE_REVIEW", feeAddress)`. See
-[Build a Scoring Module](https://docs.telegraphprotocol.com/docs/scoring/build-a-scoring-module)
-for registering and how the competition works.
+The packager writes that metadata. Do not add or edit it by hand.
 
-Check your data before spending GPU time:
-`python -m wide_runtime.train_adapter --intent CODE_REVIEW --data pairs.jsonl --check-data`
+## Requirements
 
-**Needs:** Python 3.10+, Go 1.25+, and a GPU for training.
+- Python 3.10 or newer
+- Go 1.25 or newer
+- Rust with the `wasm32-wasip1` target
+- A ModernBERT base model and a compatible LoRA reward-model checkpoint
 
-## What's in here
+Training normally needs a GPU. Exporting, baking, and packaging can run on a
+CPU, although a real model requires substantial memory.
 
-| Path | What |
-|---|---|
-| `wide_runtime/train_adapter.py` | Trains a ModernBERT LoRA reward model from preference pairs, behind a dataset gate and an evaluation gate |
-| `wide_runtime/convert_adapter.py`, `convert.py`, `format.py` | Converts the trained adapter to a Q32.32 `.imwq` model |
-| `wide_runtime/golden/`, `interp.py` | The Python reference for the fixed-point math |
-| `wide_runtime/wide_wasm/` | The Rust interpreter that runs the model inside WebAssembly |
-| `wide_runtime/wide_wasm/hosts/` | The two pinned interpreter builds every package is made from, and their lock file |
-| `cmd/adapterbuild` | Packages one `.imwq` into the registrable `.wasm` |
-| `pkg/` | The Go code `adapterbuild` uses, including copies of the Telegraph node's own loader, so a package is checked exactly as a node will load it |
-| `wide_runtime/README.md` | Technical reference: the `.imwq` format, the WASM ABI, how packages and hosts are built |
-| `legacy/v1-minilm/` | The retired V1 MiniLM `rank_answer` module. Nodes no longer accept it. Kept for reference only |
+```bash
+python -m pip install -r requirements.txt
+rustup target add wasm32-wasip1
+```
 
-## Same result as the node
+## Build an adapter
 
-A package's keccak256 is what you register, and validators check it against the
-bytes they download. Packaging is a pure function of the pinned host, your
-`.imwq` and the intent's class, so anyone with the same `.imwq` gets the same
-hash. `adapterbuild` builds every package twice, requires identical bytes, and
-loads the result with the node's own loader before writing it.
+Use the deployed intent ID, including its V2 suffix where applicable. The
+example below uses `CODE_REVIEW_GENERAL`.
 
-The code under `pkg/wasm/runtime` and `pkg/scoring` is copied from the
-[Telegraph node](https://github.com/telegraphprotocol/Telegraph), unchanged apart
-from import paths. When the node's copy changes, copy it here again.
+### 1. Train or obtain a compatible reward-model checkpoint
+
+The training utility accepts JSONL preference pairs:
+
+```json
+{"prompt":"question","chosen":"better miner answer","rejected":"worse miner answer"}
+```
+
+```bash
+python -m wide_runtime.train_adapter \
+  --intent CODE_REVIEW_GENERAL \
+  --data pairs.jsonl \
+  --out runs/CODE_REVIEW_GENERAL
+```
+
+Before training, run the data checks alone if desired:
+
+```bash
+python -m wide_runtime.train_adapter \
+  --intent CODE_REVIEW_GENERAL \
+  --data pairs.jsonl \
+  --check-data
+```
+
+### 2. Export the merged model to ONNX
+
+`export_onnx` merges the LoRA checkpoint with ModernBERT and exports one
+dynamic-length ONNX graph. It does not train or alter checkpoint weights.
+
+```bash
+python -m wide_runtime.export_onnx \
+  --base answerdotai/ModernBERT-base \
+  --adapter runs/CODE_REVIEW_GENERAL/adapter \
+  --out runs/CODE_REVIEW_GENERAL/model.onnx
+```
+
+The export command also writes `model.onnx.export.json`, including its input
+and output contract and a reference score. Keep it with the build records.
+
+### 3. Bake the ONNX graph into a WASI module
+
+```bash
+mkdir -p runs/CODE_REVIEW_GENERAL
+wide_runtime/vm_float_wasm/bake_wasm.sh \
+  runs/CODE_REVIEW_GENERAL/model.onnx \
+  runs/CODE_REVIEW_GENERAL/model.baked.wasm
+```
+
+The guest has no network access and receives only the node-provided input
+file. It accepts `input_ids` and `attention_mask` and emits one finite FP32
+score. The node sets the token IDs, attention mask, command arguments, wall
+clock, I/O limits, and memory limits; an adapter cannot choose them.
+
+### 4. Package the artifact
+
+```bash
+go run ./cmd/adapterbuild \
+  --intent CODE_REVIEW_GENERAL \
+  --baked-wasm runs/CODE_REVIEW_GENERAL/model.baked.wasm \
+  --out runs/CODE_REVIEW_GENERAL
+```
+
+This writes:
+
+```text
+runs/CODE_REVIEW_GENERAL/CODE_REVIEW_GENERAL.wasm
+runs/CODE_REVIEW_GENERAL/CODE_REVIEW_GENERAL.wasm.manifest.json
+```
+
+`adapterbuild` refuses a module that is not a WASI command, already contains
+adapter metadata, exports retired Q32.32 functions, or cannot compile under
+wazero. It packages twice and requires byte-identical output. The resulting
+manifest contains the SHA-256 hash, Keccak-256 hash, declared class, ABI,
+runtime, token cap, and build provenance.
+
+Use `--max-tokens N` only to lower the cap for this artifact; accepted values
+are 1 through 512. The default is 512.
+
+The intent class is resolved from the catalog. `--class judgment` or
+`--class hybrid` is optional and only asserts the expected class; it cannot
+override the node's live intent classification. A class mismatch is a failed
+build or registration, not a fallback.
+
+## Verify before submission
+
+Run the kit tests:
+
+```bash
+go test ./...
+```
+
+Check the package and manifest before publishing them:
+
+```bash
+shasum -a 256 runs/CODE_REVIEW_GENERAL/CODE_REVIEW_GENERAL.wasm
+cat runs/CODE_REVIEW_GENERAL/CODE_REVIEW_GENERAL.wasm.manifest.json
+```
+
+The node performs additional checks when the candidate is submitted:
+
+1. It verifies ABI v2, `onnx_f32`, the intent class, the token cap, module
+   imports, exports, and size limits.
+2. It runs a fixed smoke input. A module that traps, emits malformed output,
+   or returns a non-finite result is rejected.
+3. It evaluates a valid candidate against the intent's evaluation material.
+   Lack of compatible material leaves the candidate pending; it is not a pass.
+
+A successfully packaged file is therefore not automatically active or ranked.
+
+## Publish and submit
+
+`adapterbuild --publish` uploads a built artifact and its manifest to the
+configured S3-compatible object store. It does not activate the adapter.
+
+```bash
+OBJECT_STORE_ENDPOINT=https://object-store.example \
+OBJECT_STORE_BUCKET=telegraph-adapters \
+OBJECT_STORE_ACCESS_KEY=... \
+OBJECT_STORE_SECRET_KEY=... \
+go run ./cmd/adapterbuild \
+  --intent CODE_REVIEW_GENERAL \
+  --artifact runs/CODE_REVIEW_GENERAL/CODE_REVIEW_GENERAL.wasm \
+  --publish
+```
+
+Submit the resulting immutable URL and Keccak-256 hash through the Telegraph
+V2 adapter-registration flow. Do not replace bytes at a URL that has already
+been registered: validators verify downloaded bytes against the registered
+hash. The publisher rejects replacing different bytes unless `--overwrite` is
+explicitly provided.
+
+## Determinism and compatibility
+
+The FP32 model path is the supported V2 format. Packaging is reproducible for
+the same baked input, but model-score bit identity across arbitrary CPUs and
+runtimes is not established by this kit. Do not claim cross-machine
+bit-identical inference without an end-to-end test against the target node
+versions and CPU environments.
+
+The retired Q32.32 `.imwq` tooling remains in `wide_runtime/wide_wasm` only as
+historical reference. V2 model adapters must use the ONNX/WASI path above.
+
+## Repository layout
+
+| Path | Purpose |
+| --- | --- |
+| `wide_runtime/train_adapter.py` | Trains a ModernBERT LoRA reward model from preference pairs. |
+| `wide_runtime/export_onnx.py` | Merges and exports the trained model to ONNX. |
+| `wide_runtime/vm_float_wasm/` | Restricted WASI guest and bake script. |
+| `cmd/adapterbuild` | Adds V2 metadata, verifies the module, writes the artifact and manifest, and optionally publishes. |
+| `pkg/adapterbuild/` | Builder, catalog-class, manifest, and publish checks. |
+| `pkg/wasm/runtime/` | Shared package metadata validation used by the kit. |
+| `wide_runtime/wide_wasm/` | Retired Q32.32 implementation; not the V2 model path. |
 
 ## License
 
