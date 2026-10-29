@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/telegraphprotocol/telegraph-wasm-baseline/pkg/wasm/wasmbin"
 )
@@ -14,111 +15,145 @@ import (
 type ArtifactKind uint8
 
 const (
-	// KindMiniLMWasm is a self-contained MiniLM .wasm module scored through a
-	// wasmrt.Pool via the rank_answer ABI. This is the historical/default kind.
-	KindMiniLMWasm ArtifactKind = iota
+	// KindOther is anything that is not a model adapter: a comparator module
+	// (deterministic intents), a retired MiniLM rank_answer module, or bytes
+	// that are not a module at all. Callers route it by intent class.
+	KindOther ArtifactKind = iota
 
-	// KindWideIMWQ is a bare wide Q32.32 model image (.imwq artifact), NOT a
-	// wasm module: it is uploaded into a shared wide interpreter's linear memory
-	// via WideRuntime.LoadArtifact and scored via imwq_score / imwq_score_hybrid.
-	// The dev/split path.
-	KindWideIMWQ
+	// KindFloatModel is a LEGACY full-model float adapter: a WASI command
+	// (exports `_start`) carrying a whole ONNX float32 model and its engine.
+	// No longer accepted: it is recognised only to be rejected by name
+	// (LegacyFullModelReason). Adapters are KindLoRAAdapter deltas on the
+	// shared Foundation Model.
+	KindFloatModel
 
-	// KindWideEmbedded is a SELF-CONTAINED wide package: one .wasm carrying the
-	// wide interpreter AND one intent's .imwq as a resident data segment (built
-	// by cmd/wideembed). It is recognised by the imwq_embedded export, loaded by
-	// NewWideEmbedded / NewWideHybridEmbedded, and needs no LoadArtifact and no
-	// shared interpreter — the registered hash covers model and code together.
-	//
-	// Appended after KindWideIMWQ so existing values do not move.
-	KindWideEmbedded
+	// KindLoRAAdapter is an Evaluator adapter for the shared Foundation Model:
+	// a safetensors LoRA delta package (lora_adapter.go), scored by LoRARuntime.
+	KindLoRAAdapter
+
+	// KindRetiredQ32 is a Q32.32 wide artifact — a bare .imwq model image
+	// (IMWQ magic) or a module exporting imwq_* functions (the wide
+	// interpreter, or a self-contained wide package). The format is retired:
+	// it is refused at registration and never loaded or scored.
+	KindRetiredQ32
 )
+
+// RetiredQ32Reason is the one message every path that meets a Q32.32 wide
+// artifact reports (Stage 1, the gate, promotion, startup hydration).
+const RetiredQ32Reason = "Q32.32 wide adapters are retired; package the adapter as a safetensors delta for the shared Foundation Model"
+
+// LegacyFullModelReason is the one message every path that meets a legacy
+// full-model float adapter (a WASI command with the whole model baked in)
+// reports: Stage 1, the fetch (without downloading the ~600 MB), the gate,
+// promotion and startup hydration. The format is no longer accepted; an
+// adapter already registered in it must be repackaged as a delta and
+// re-registered.
+const LegacyFullModelReason = "legacy_full_model: full-model float adapters are no longer accepted; repackage the adapter as a safetensors delta for the shared Foundation Model and re-register it"
 
 // String names the kind for logs and errors.
 func (k ArtifactKind) String() string {
 	switch k {
-	case KindMiniLMWasm:
-		return "minilm-wasm"
-	case KindWideIMWQ:
-		return "wide-imwq"
-	case KindWideEmbedded:
-		return "wide-embedded"
+	case KindOther:
+		return "other"
+	case KindFloatModel:
+		return "float-model"
+	case KindLoRAAdapter:
+		return "lora-adapter"
+	case KindRetiredQ32:
+		return "retired-q32"
 	default:
 		return fmt.Sprintf("ArtifactKind(%d)", uint8(k))
 	}
 }
 
-// imwqMagic is the four ASCII bytes a wide Q32.32 model image begins with. It
-// is the SAME check WideRuntime.LoadArtifact makes before uploading an
-// artifact; kept here as the single source of truth so the promote-path kind
-// branch and the loader cannot drift apart.
-const imwqMagic = "IMWQ"
+// q32Magic is the four ASCII bytes a Q32.32 model image (.imwq) begins with.
+const q32Magic = "IMWQ"
+
+// q32ExportPrefix prefixes every export of a Q32.32 wide module.
+const q32ExportPrefix = "imwq_"
 
 // ArtifactKindOf classifies raw promote-path bytes:
 //
-//   - leading "IMWQ" magic              -> KindWideIMWQ (bare model image)
-//   - wasm exporting imwq_embedded      -> KindWideEmbedded (self-contained package)
-//   - anything else                     -> KindMiniLMWasm
+//   - a safetensors header whose __metadata__ abi is lora-* -> KindLoRAAdapter
+//   - leading "IMWQ" magic, or a module exporting imwq_*  -> KindRetiredQ32
+//   - a module exporting a `_start` function              -> KindFloatModel
+//   - anything else                                       -> KindOther
 //
 // Deliberately a cheap, total function: it never errors and never compiles the
-// module (the embedded probe reads only section headers up to the export
-// section, so a 1.2 GB package costs microseconds). Anything that is not
-// positively wide is handed to the MiniLM loader, which reports its own error
-// if the bytes are not a valid rank_answer module. A wide-looking module that is
-// broken past its export section (e.g. truncated) is classified wide and then
-// fails loudly in NewWideEmbedded — never silently re-routed.
+// module. It reads section headers only up to the export section, which
+// precedes the code and data sections, so it is microseconds on a 600 MB
+// legacy module and works on the first megabyte of a download. Whether a delta
+// package is actually loadable is ParseLoRAAdapter's (and the engine's) job;
+// this only decides which path it takes.
 func ArtifactKindOf(b []byte) ArtifactKind {
-	if IsWideIMWQ(b) {
-		return KindWideIMWQ
+	if IsLoRAPackage(b) {
+		return KindLoRAAdapter
 	}
-	if IsWideEmbeddedWasm(b) {
-		return KindWideEmbedded
+	if IsRetiredQ32(b) {
+		return KindRetiredQ32
 	}
-	return KindMiniLMWasm
+	if IsFloatModel(b) {
+		return KindFloatModel
+	}
+	return KindOther
 }
 
-// IsWideIMWQ reports whether b is a bare wide Q32.32 model image (starts with
-// the IMWQ magic).
-func IsWideIMWQ(b []byte) bool {
-	return len(b) >= len(imwqMagic) && string(b[:len(imwqMagic)]) == imwqMagic
-}
+// comparatorExport is the export of the comparator ABI (deterministic
+// intents), which did not change with the adapter format.
+const comparatorExport = "imw_score_deterministic"
 
-// IsWideEmbeddedWasm reports whether b is a wasm module exporting the
-// imwq_embedded function — the discriminator of a self-contained wide package
-// (or of a bare embed host, which then fails NewWideEmbedded loudly with "no
-// embedded model"). It inspects the export section only; it does not validate
-// or compile the module.
-func IsWideEmbeddedWasm(b []byte) bool {
+// IsRetiredQ32 reports whether b is a Q32.32 wide ADAPTER artifact: a bare
+// .imwq image, or a wasm module with imwq_* exports that is not also a
+// comparator module.
+//
+// The exception matters: the shared Q32.32 interpreter build (wide_wasm.wasm)
+// also exports imw_score_deterministic and may be registered as a
+// deterministic intent's comparator. As a comparator its ABI is unchanged, so
+// it is routed by intent class like any comparator module — never refused, and
+// never skipped at restart, as a retired adapter. A judgment/hybrid
+// registration of it is still refused (HasQ32Exports).
+func IsRetiredQ32(b []byte) bool {
+	if len(b) >= len(q32Magic) && string(b[:len(q32Magic)]) == q32Magic {
+		return true
+	}
 	names, err := wasmbin.ExportNames(b)
 	if err != nil {
 		return false
 	}
-	kind, ok := names[fnWideEmbedded]
-	return ok && kind == wasmbin.ExportFunc
+	if k, ok := names[comparatorExport]; ok && k == wasmbin.ExportFunc {
+		return false
+	}
+	return hasQ32Export(names)
 }
 
-// IsWideArtifact reports whether b takes the wide path in either form (bare
-// .imwq or self-contained package). This is the one predicate Scorer.Promote
-// and the candidate evaluator use to decide "wide, not MiniLM".
-func IsWideArtifact(b []byte) bool {
-	k := ArtifactKindOf(b)
-	return k == KindWideIMWQ || k == KindWideEmbedded
-}
-
-// WideEmbeddedIsHybrid reports whether a self-contained wide package carries
-// the hybrid half (exports imwq_score_hybrid). A package DECLARES its class by
-// its exports — a judgment build (--features embedded) has no hybrid export, a
-// hybrid build (--features embedded-hybrid) has one — so the installer and the
-// gate can refuse a package submitted for the wrong class of intent instead of
-// silently scoring it on the other path.
-func WideEmbeddedIsHybrid(b []byte) (bool, error) {
+// HasQ32Exports reports whether b is a bare .imwq or a module with any imwq_*
+// export, comparator or not. Stage 1 uses it for judgment/hybrid intents,
+// where no imwq_* module is acceptable.
+func HasQ32Exports(b []byte) bool {
+	if len(b) >= len(q32Magic) && string(b[:len(q32Magic)]) == q32Magic {
+		return true
+	}
 	names, err := wasmbin.ExportNames(b)
-	if err != nil {
-		return false, fmt.Errorf("wasm/runtime: reading exports of a wide package: %w", err)
+	return err == nil && hasQ32Export(names)
+}
+
+func hasQ32Export(names map[string]byte) bool {
+	for n := range names {
+		if strings.HasPrefix(n, q32ExportPrefix) {
+			return true
+		}
 	}
-	if k, ok := names[fnWideEmbedded]; !ok || k != wasmbin.ExportFunc {
-		return false, fmt.Errorf("wasm/runtime: not a self-contained wide package (no %q export)", fnWideEmbedded)
+	return false
+}
+
+// IsFloatModel reports whether b is a LEGACY full-model float adapter: a wasm
+// module (not a retired Q32.32 one) exporting a `_start` function, a WASI
+// command. Such an artifact is rejected (LegacyFullModelReason).
+func IsFloatModel(b []byte) bool {
+	names, err := wasmbin.ExportNames(b)
+	if err != nil || hasQ32Export(names) {
+		return false
 	}
-	k, ok := names[fnWideScoreHybrid]
-	return ok && k == wasmbin.ExportFunc, nil
+	k, ok := names[fnStart]
+	return ok && k == wasmbin.ExportFunc
 }

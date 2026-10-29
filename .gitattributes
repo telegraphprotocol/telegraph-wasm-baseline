@@ -1,9 +1,11 @@
-# Wasm modules are binary: never touch their bytes (the pinned embed hosts are
-# verified by sha256 against hosts.lock.json).
+# Binary artifacts: never touch their bytes (a package's sha256/keccak256 is its identity).
 *.wasm binary
+*.onnx binary
+*.safetensors binary
 
-# The embed-host build inputs must check out byte-identical on every OS, or the
-# reproducible Docker build (build-hosts.sh) hashes different sources.
-wide_runtime/wide_wasm/** text=auto eol=lf
-wide_runtime/wide_wasm/**/*.wasm binary
-wide_runtime/wide_wasm/**/*.imwq binary
+# The engine build inputs (crate, lock, toolchain pin, script) must check out byte-identical
+# on every OS, and the shell scripts must run under bash on Linux.
+float_runtime/engine/** text eol=lf
+*.sh text eol=lf
+*.py text eol=lf
+float_runtime/testdata/*.json text eol=lf

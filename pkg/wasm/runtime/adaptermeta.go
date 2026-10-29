@@ -9,30 +9,55 @@ import (
 	"github.com/telegraphprotocol/telegraph-wasm-baseline/pkg/wasm/wasmbin"
 )
 
-// AdapterMetaSection is the name of the custom section a scoring adapter
-// carries its version metadata in. It is written by the package builder
-// (cmd/wideembed) and read at registration (Stage 1), so a module built for a
-// different scoring ABI is refused before it is ever loaded. Living inside the
-// module, it is covered by the registered wasm_hash and needs no contract or
-// database change.
+// AdapterMetaSection is the name of the custom section a scoring module
+// carries its version metadata in. It is written by the adapter kit's
+// packager and read at registration (Stage 1) and at load, so a module built
+// for a different scoring ABI is refused before it is ever run. Living inside
+// the module, it is covered by the registered wasm_hash and needs no contract
+// or database change.
 const AdapterMetaSection = "telegraph.adapter"
 
-// AdapterABIVersion is the scoring ABI this node implements (see
-// docs/dev-docs/scoring-adapter-standard.md). Bump it only together with an
-// incompatible change to the exports or their argument layout.
-const AdapterABIVersion = 1
+// AdapterABIVersion is the scoring ABI this node implements for MODEL adapters
+// (judgment and hybrid intents): version 2 (see docs/dev-docs/wasm-scoring.md).
+// A delta package carries its metadata in its safetensors header and this
+// section is only the shape LoRARuntime.Meta reports it in. Version 1 was the
+// Q32.32 wide format, which is retired: a version 1 section on a model adapter
+// is refused with RetiredQ32Reason.
+const AdapterABIVersion = 2
+
+// ComparatorABIVersion is the ABI of COMPARATOR modules (deterministic
+// intents, imw_score_deterministic). Their exports did not change when the
+// model format did, so it stays at 1; the section stays optional for them.
+const ComparatorABIVersion = 1
+
+// AdapterRuntimeONNXF32 named the LEGACY full-model runtime (an ONNX float32
+// graph baked into a WASI command). No longer accepted: a section declaring
+// it is refused with LegacyFullModelReason. Model adapters declare LoRAABI.
+const AdapterRuntimeONNXF32 = "onnx_f32"
+
+// Adapter classes a section may declare.
+const (
+	ClassJudgment   = "judgment"
+	ClassHybrid     = "hybrid"
+	ClassComparator = "comparator"
+)
 
 // AdapterMeta is the JSON payload of the AdapterMetaSection.
 type AdapterMeta struct {
 	ABIVersion int    `json:"abi_version"`
 	Class      string `json:"class,omitempty"` // "judgment" | "hybrid" | "comparator"
 	Tool       string `json:"tool,omitempty"`  // builder that wrote the section, informational
+	// Runtime names the model runtime of a model adapter: LoRAABI ("lora-v1");
+	// "onnx_f32" named the retired full-model runtime and is refused. Absent on
+	// comparator modules.
+	Runtime string `json:"runtime,omitempty"`
+	// MaxTokens optionally lowers the token cap the node scores this adapter
+	// with (default DefaultFloatMaxTokens, at most MaxFloatMaxTokens).
+	MaxTokens int `json:"max_tokens,omitempty"`
 	// Training is the optional, SELF-REPORTED training record our own builds
-	// embed (cmd/adapterbuild --training-record). The node only checks that it
-	// is well-formed and never uses it to decide anything (promotion, ranking):
-	// the per-child eval gate is the real check. omitempty keeps a section
-	// without it byte-identical to one written before the field existed, so the
-	// field is additive and AdapterABIVersion is unchanged.
+	// embed (the kit's --training-record). The node only checks that it is
+	// well-formed and never uses it to decide anything (promotion, ranking):
+	// the per-child eval gate is the real check.
 	Training *TrainingRecord `json:"training,omitempty"`
 }
 
@@ -132,7 +157,8 @@ func (m AdapterMeta) Encode() []byte {
 }
 
 // ReadAdapterMeta returns the module's adapter metadata, or nil when the
-// module carries none (an adapter built before the section existed). A section
+// module carries none (a comparator module may omit it; a model adapter is a
+// safetensors delta package and carries its metadata in its header). A section
 // that is present but unreadable is an error: the builder wrote something the
 // node cannot interpret. A training record of the wrong shape is reported as a
 // *TrainingRecordError ("training record: ...").
@@ -155,15 +181,53 @@ func ReadAdapterMeta(b []byte) (*AdapterMeta, error) {
 	return &m, nil
 }
 
-// Check reports why this node cannot run an adapter declaring m, or nil.
-// wantClass, when non-empty, is the class the module's exports say it is. A
-// training record, when present, is checked for shape only.
+// Check reports why this node cannot run a module declaring m, or nil.
+// wantClass is what the caller needs the module to be:
+//
+//   - "comparator": a comparator module. abi_version must be
+//     ComparatorABIVersion; the class, when set, must be "comparator".
+//   - "judgment" / "hybrid" / "" (either): a model adapter.
+//     abi_version 1 is the retired Q32.32 format (RetiredQ32Reason); runtime
+//     "onnx_f32" is the retired full-model format (LegacyFullModelReason);
+//     otherwise it must be AdapterABIVersion with runtime LoRAABI, a class
+//     of judgment or hybrid (matching wantClass when one is given) and
+//     max_tokens, if set, in [1, MaxFloatMaxTokens].
+//
+// A training record, when present, is checked for shape only.
 func (m AdapterMeta) Check(wantClass string) error {
+	if wantClass == ClassComparator {
+		if m.ABIVersion != ComparatorABIVersion {
+			return fmt.Errorf("built for comparator ABI version %d, this node implements version %d", m.ABIVersion, ComparatorABIVersion)
+		}
+		if m.Class != "" && m.Class != ClassComparator {
+			return fmt.Errorf("declares class %q but its exports make it a %q module", m.Class, ClassComparator)
+		}
+		return m.Training.Validate()
+	}
+	if m.ABIVersion == 1 {
+		return errors.New(RetiredQ32Reason)
+	}
 	if m.ABIVersion != AdapterABIVersion {
 		return fmt.Errorf("built for scoring ABI version %d, this node implements version %d", m.ABIVersion, AdapterABIVersion)
 	}
-	if wantClass != "" && m.Class != "" && m.Class != wantClass {
-		return fmt.Errorf("declares class %q but its exports make it a %q adapter", m.Class, wantClass)
+	if m.Runtime == AdapterRuntimeONNXF32 {
+		return errors.New(LegacyFullModelReason)
+	}
+	if m.Runtime != LoRAABI {
+		return fmt.Errorf("declares runtime %q; this node runs only %q adapters", m.Runtime, LoRAABI)
+	}
+	switch m.Class {
+	case ClassJudgment, ClassHybrid:
+	case "":
+		return fmt.Errorf("declares no class; a float adapter must say %q or %q", ClassJudgment, ClassHybrid)
+	default:
+		return fmt.Errorf("declares class %q; a float adapter is %q or %q", m.Class, ClassJudgment, ClassHybrid)
+	}
+	if wantClass != "" && m.Class != wantClass {
+		return fmt.Errorf("declares class %q but the intent is a %q intent", m.Class, wantClass)
+	}
+	if m.MaxTokens < 0 || m.MaxTokens > MaxFloatMaxTokens {
+		return fmt.Errorf("max_tokens %d is outside [1, %d]", m.MaxTokens, MaxFloatMaxTokens)
 	}
 	return m.Training.Validate()
 }

@@ -108,7 +108,7 @@ func CloseCompilationCache(ctx context.Context) error {
 	return c.Close(ctx)
 }
 
-// cachedRuntimeConfig is the runtime config every wide (and comparator)
+// cachedRuntimeConfig is the runtime config every float-adapter and comparator
 // runtime is built with: wazero defaults plus the shared compilation cache.
 func cachedRuntimeConfig() wazero.RuntimeConfig {
 	return wazero.NewRuntimeConfig().WithCompilationCache(SharedCompilationCache())

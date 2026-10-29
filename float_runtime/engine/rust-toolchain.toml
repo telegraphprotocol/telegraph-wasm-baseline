@@ -1,0 +1,7 @@
+# Pinned compiler. The engine's sha256 is FOUNDATION_ENGINE_WASM_HASH on every validator, so
+# anyone rebuilding it must get the same bytes. A different rustc emits different bytes.
+# Bump deliberately, never incidentally.
+[toolchain]
+channel = "1.98.1"
+targets = ["wasm32-wasip1"]
+profile = "minimal"
