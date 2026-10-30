@@ -17,10 +17,15 @@ import (
 //     (catalog.CompiledClassOf) — the builder normally runs offline;
 //   - deterministic / fact-checkable intents are refused: they are scored by the
 //     shared comparator module and never get a wide package;
-//   - an intent the catalog does not know is refused;
-//   - an explicit class, when given, must agree — a mismatch is an error, never
-//     an override, because a package built for the wrong class is refused by
-//     every node at install time (or, worse, scored by the wrong path).
+//   - an intent the catalog does not know takes an explicit --class judgment or
+//     hybrid: the compiled-in list predates many live judgment/hybrid prefixes
+//     (for example WEATHER_FORECAST_VERIFY), and the node still refuses a package
+//     whose class does not match the intent's live class. Without --class it is
+//     refused, with a pointer to the node's resolver;
+//   - for an intent the catalog does know, an explicit class must agree — a
+//     mismatch is an error, never an override, because a package built for the
+//     wrong class is refused by every node at install time (or, worse, scored by
+//     the wrong path).
 func ResolveClass(intent, explicit string) (wideembed.Class, error) {
 	if intent == "" {
 		return "", fmt.Errorf("adapterbuild: intent is required")
@@ -32,7 +37,11 @@ func ResolveClass(intent, explicit string) (wideembed.Class, error) {
 			return "", fmt.Errorf("adapterbuild: %s is a deterministic (fact-checkable) intent — it is scored by the "+
 				"shared comparator module and does not get a wide package", intent)
 		}
-		return "", fmt.Errorf("adapterbuild: %s is not a judgment or hybrid intent in the %s — refusing to guess a class", intent, source)
+		if explicit == string(wideembed.ClassJudgment) || explicit == string(wideembed.ClassHybrid) {
+			return wideembed.Class(explicit), nil
+		}
+		return "", fmt.Errorf("adapterbuild: %s is not a judgment or hybrid intent in the %s — refusing to guess a class; "+
+			"if the node lists it (GET /api/wasm?resolve=%s), pass --class judgment or --class hybrid", intent, source, intent)
 	}
 	var derived wideembed.Class
 	switch c {

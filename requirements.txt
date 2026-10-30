@@ -5,6 +5,7 @@ transformers>=4.48   # ModernBERT support
 peft
 numpy
 onnx>=1.17
+onnxscript   # torch>=2.9's default dynamo exporter imports it; export_onnx uses the TorchScript exporter
 huggingface_hub>=0.27
 # only for --hf-dataset
 datasets

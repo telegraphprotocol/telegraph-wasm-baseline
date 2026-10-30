@@ -10,9 +10,32 @@ limit.
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import sys
 from pathlib import Path
+
+
+def legacy_export_kwargs(export_fn) -> dict:
+    """torch >= 2.9 defaults torch.onnx.export to the dynamo exporter, which writes the
+    weights to a separate <model>.onnx.data file that the bake does not embed. The
+    TorchScript exporter writes one self-contained file (ModernBERT-base FP32 is about
+    600 MB, under protobuf's 2 GB limit). Older torch has no `dynamo` argument and
+    already uses that exporter."""
+    return {"dynamo": False} if "dynamo" in inspect.signature(export_fn).parameters else {}
+
+
+def check_self_contained(model, path) -> None:
+    """Refuse an ONNX model that keeps tensors outside the file: the bake embeds only
+    this one file, so a split model would bake into a module without its weights."""
+    import onnx
+    external = [t.name for t in model.graph.initializer
+                if t.data_location == onnx.TensorProto.EXTERNAL]
+    if external:
+        raise SystemExit(
+            f"export_onnx: {path} stores {len(external)} tensors as external data "
+            f"(first: {external[0]}); the bake would embed the graph without its weights. "
+            "Export a single self-contained file.")
 
 
 def export_adapter(base_model: str, adapter: str, out_path: str,
@@ -80,6 +103,8 @@ def export_adapter(base_model: str, adapter: str, out_path: str,
     dummy_mask = torch.ones_like(dummy_ids)
     out = Path(out_path)
     out.parent.mkdir(parents=True, exist_ok=True)
+    # a weights sidecar left by an earlier split export would stop the bake
+    Path(str(out) + ".data").unlink(missing_ok=True)
     with torch.inference_mode():
         reference = wrapped(dummy_ids, dummy_mask).detach().cpu().float().reshape(-1)[0]
         torch.onnx.export(
@@ -95,8 +120,10 @@ def export_adapter(base_model: str, adapter: str, out_path: str,
             },
             opset_version=17,
             do_constant_folding=True,
+            **legacy_export_kwargs(torch.onnx.export),
         )
     model = onnx.load(str(out), load_external_data=False)
+    check_self_contained(model, out)
     onnx.checker.check_model(model)
     result = {
         "base_model": base_model,
