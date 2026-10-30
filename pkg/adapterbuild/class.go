@@ -2,6 +2,7 @@ package adapterbuild
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/telegraphprotocol/telegraph-wasm-baseline/pkg/scoring/catalog"
 	"github.com/telegraphprotocol/telegraph-wasm-baseline/pkg/scoring/comparator"
@@ -63,5 +64,14 @@ func classSource() (func(string) (catalog.Class, bool), string) {
 	if catalog.LoadedClassCount() > 0 {
 		return catalog.ClassOf, "intent_classes (loaded)"
 	}
-	return catalog.CompiledClassOf, "compiled-in catalog"
+	return compiledClassOf, "compiled-in catalog"
+}
+
+// compiledClassOf resolves the live catalog's *_GENERAL IDs to their original
+// intent's compiled-in class; a loaded intent_classes table is never overridden.
+func compiledClassOf(intent string) (catalog.Class, bool) {
+	if c, ok := catalog.CompiledClassOf(intent); ok {
+		return c, ok
+	}
+	return catalog.CompiledClassOf(strings.TrimSuffix(intent, "_GENERAL"))
 }

@@ -12,6 +12,8 @@ func TestResolveClass(t *testing.T) {
 		{"EMAIL_SECURITY", "", "hybrid"},
 		{"CODE_REVIEW", "", "judgment"},
 		{"CODE_REVIEW", "judgment", "judgment"},
+		{"CODE_REVIEW_GENERAL", "", "judgment"},
+		{"EMAIL_SECURITY_GENERAL", "", "hybrid"},
 	}
 	for _, c := range ok {
 		got, err := ResolveClass(c.intent, c.explicit)
