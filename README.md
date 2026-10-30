@@ -74,6 +74,12 @@ python -m wide_runtime.export_onnx \
 The export command also writes `model.onnx.export.json`, including its input
 and output contract and a reference score. Keep it with the build records.
 
+The output is one self-contained file of about 600 MB. On torch 2.9 or newer,
+`torch.onnx.export` defaults to the dynamo exporter, which writes the weights to
+a separate `model.onnx.data` file that the bake cannot embed; `export_onnx`
+therefore uses the TorchScript exporter and refuses any model whose tensors are
+stored as external data.
+
 ### 3. Bake the ONNX graph into a WASI module
 
 ```bash
@@ -82,6 +88,11 @@ wide_runtime/vm_float_wasm/bake_wasm.sh \
   runs/CODE_REVIEW_GENERAL/model.onnx \
   runs/CODE_REVIEW_GENERAL/model.baked.wasm
 ```
+
+The bake embeds only the named `.onnx` file. It refuses to build when a
+`<model>.onnx.data` weights file sits beside it, or when the model is under
+16 MiB (a graph without its weights); set `TELEGRAPH_ALLOW_SMALL_ONNX=1` only
+for a deliberately tiny test model.
 
 The guest has no network access and receives only the node-provided input
 file. It accepts `input_ids` and `attention_mask` and emits one finite FP32
@@ -115,7 +126,10 @@ are 1 through 512. The default is 512.
 
 The intent class is resolved from the catalog. `--class judgment` or
 `--class hybrid` is optional and only asserts the expected class; it cannot
-override the node's live intent classification. A class mismatch is a failed
+override the node's live intent classification. The compiled-in catalog does
+not list every live judgment or hybrid prefix: for an intent it does not list,
+check the node (`GET /api/wasm?resolve=<INTENT>`) and pass its class with
+`--class`. A class mismatch is a failed
 build or registration, not a fallback.
 
 ## Verify before submission
@@ -124,6 +138,7 @@ Run the kit tests:
 
 ```bash
 go test ./...
+python -m wide_runtime.test_export_onnx
 ```
 
 Check the package and manifest before publishing them:
