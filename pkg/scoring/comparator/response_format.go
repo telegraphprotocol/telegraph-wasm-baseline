@@ -1,12 +1,14 @@
 package comparator
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
 
-	"github.com/rs/zerolog/log"
 	"gopkg.in/yaml.v3"
 
 	"github.com/telegraphprotocol/telegraph-wasm-baseline/pkg/scoring/intentformat"
@@ -14,16 +16,11 @@ import (
 )
 
 // The per-intent response parser (the intent's response format + a small
-// model) is the first of the three parse paths in ParseMinerValue:
-//
-//  1. the intent has a format with a scored field AND a parser is installed
-//     (PARSER_LLM_ENABLED=true)                    -> the parser model
-//  2. else the miner declared a mapping in its YAML -> ParseWithMapping
-//  3. else a hand-written parser for the slug       -> parsersByIntent
-//
-// Paths 2 and 3 stay until the parser has shown parity on live responses
-// (run with PARSER_LLM_SHADOW=true first). With no parser installed the
-// first path does not exist and scoring is exactly what it was.
+// model) is the ONLY reader of a miner's answer (ParseMinerValue): no miner is
+// named in code, so a new miner is read the same way as every other from its
+// first answer. It needs a parser installed (PARSER_LLM_ENABLED=true) and a
+// format with a scored field for the intent; without either, the intent's
+// miners cannot be scored and are left out (never scored 0).
 //
 // The format comes from FormatFor: the node's loaded intent format registry
 // (pkg/scoring/intentformat: intent_response_formats, then
@@ -34,7 +31,11 @@ var responseParser struct {
 	p *responseparser.Parser
 }
 
-// UseResponseParser installs the parser model; nil removes it (path off).
+// ErrNoParser: no parser model is installed, so a miner's answer cannot be
+// read. The miner is left out of the question, not scored 0.
+var ErrNoParser = errors.New("response parser not installed (PARSER_LLM_ENABLED): a miner's answer cannot be read")
+
+// UseResponseParser installs the parser model; nil removes it.
 func UseResponseParser(p *responseparser.Parser) {
 	responseParser.Lock()
 	defer responseParser.Unlock()
@@ -47,19 +48,18 @@ func activeResponseParser() *responseparser.Parser {
 	return responseParser.p
 }
 
-// parseViaResponseFormat runs the parser model for an intent with a format.
-// handled=false means this path does not apply (no parser, no format) or the
-// model never answered (server down, timeout, body too large) - the caller
-// then uses the older paths, so an outage degrades to today's behaviour rather
-// than to scoring nobody. Every other failure is final: not scored.
-func parseViaResponseFormat(ctx context.Context, intentID, slug, key, body string) (v float64, handled bool, err error) {
+// parseViaResponseFormat reads a miner's value with the parser model and the
+// intent's format. Every failure is final for this question (not scored,
+// never 0): no parser, no format, the model never answered (server down,
+// timeout, body too large), or no usable value in the reply.
+func parseViaResponseFormat(ctx context.Context, intentID, slug, key, body string) (float64, error) {
 	p := activeResponseParser()
 	if p == nil {
-		return 0, false, nil
+		return 0, ErrNoParser
 	}
 	format, _, ok := FormatFor(intentID)
 	if !ok || !format.HasScored() {
-		return 0, false, nil
+		return 0, fmt.Errorf("intent %s has no response format with a scored field: miner %q's answer cannot be read", intentID, slug)
 	}
 	cfg, _ := ConfigFor(intentID)
 	res, err := p.Parse(ctx, responseparser.Request{
@@ -67,51 +67,10 @@ func parseViaResponseFormat(ctx context.Context, intentID, slug, key, body strin
 		Format: format, KeyParams: cfg.KeyParams[key],
 		Unit: MinerUnitFor(slug),
 	})
-	if p.Shadow() {
-		// Shadow mode: the older paths decide; the parser's answer is only
-		// logged next to theirs, which is how parity is measured live before
-		// an intent is switched over.
-		legacy, legacyErr := parseLegacy(intentID, slug, key, body)
-		ev := log.Info().Str("intent", intentID).Str("miner", slug).Str("key", key).
-			Str("reply", res.Reply).Str("copied", res.Copied)
-		if err == nil {
-			ev = ev.Float64("parser_value", res.Value)
-		} else {
-			ev = ev.Str("parser_error", err.Error())
-		}
-		if legacyErr == nil {
-			ev = ev.Float64("legacy_value", legacy)
-		} else {
-			ev = ev.Str("legacy_error", legacyErr.Error())
-		}
-		ev.Bool("agree", err == nil && legacyErr == nil && sameValue(res.Value, legacy)).
-			Msg("[response_parser] shadow comparison")
-		return 0, false, nil
-	}
 	if err != nil {
-		if responseparser.IsUnavailable(err) {
-			log.Warn().Err(err).Str("intent", intentID).Str("miner", slug).Str("key", key).
-				Msg("[response_parser] model unavailable — falling back to the declared mapping / hardcoded parser")
-			return 0, false, nil
-		}
-		return 0, true, fmt.Errorf("parsing %s response via the %s response format: %w", slug, intentID, err)
+		return 0, fmt.Errorf("parsing %s response via the %s response format: %w", slug, intentID, err)
 	}
-	return res.Value, true, nil
-}
-
-func sameValue(a, b float64) bool {
-	d := a - b
-	if d < 0 {
-		d = -d
-	}
-	m := b
-	if m < 0 {
-		m = -m
-	}
-	if m < 1 {
-		m = 1
-	}
-	return d <= 1e-6*m
+	return res.Value, nil
 }
 
 // ── miner-declared units ─────────────────────────────────────────────────────
@@ -131,6 +90,17 @@ func sameValue(a, b float64) bool {
 var minerUnits struct {
 	sync.RWMutex
 	bySlug map[string]string
+}
+
+// minerYAML is the subset of a registration YAML (a miner's, or a truth
+// source's) this package reads: the declared unit. Decoding only that means a
+// miner adding an unrelated key cannot break scoring.
+type minerYAML struct {
+	Semantics struct {
+		SignalMapping struct {
+			Unit string `yaml:"unit"`
+		} `yaml:"signal_mapping"`
+	} `yaml:"semantics"`
 }
 
 // SetMinerUnit records the unit a miner quotes in; "" removes it.
@@ -155,10 +125,8 @@ func MinerUnitFor(slug string) string {
 }
 
 // LoadMinerUnits reads semantics.signal_mapping.unit from each miner's
-// registration YAML. Only the unit is read: this deliberately does NOT
-// activate the miner's declared mapping (LoadMinerMappings does that), so
-// turning the parser on cannot change which mapping path other miners take.
-// Per-slug errors are returned rather than failing the batch.
+// registration YAML. Per-slug errors are returned rather than failing the
+// batch.
 func LoadMinerUnits(rawBySlug map[string]string) map[string]error {
 	errs := make(map[string]error)
 	for slug, raw := range rawBySlug {
@@ -286,9 +254,97 @@ func ShapeForUser(ctx context.Context, intentID, slug, query, body string, raw a
 	}
 }
 
+// AnswerText is a miner's answer as the text the parser model reads AND the
+// verbatim guard checks - one string for both, so the guard checks exactly
+// what the model saw. A decoded value is re-encoded as JSON, without HTML
+// escaping so "<", ">" and "&" read as written; a string is used as is.
+func AnswerText(data any) (string, bool) {
+	switch v := data.(type) {
+	case string:
+		return v, true
+	case []byte:
+		return string(v), true
+	case json.RawMessage:
+		return string(v), true
+	}
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(data); err != nil {
+		return "", false
+	}
+	return strings.TrimSuffix(buf.String(), "\n"), true
+}
+
+// ChainShape is a job's answer as its contract receives it: the processed
+// answer ShapeForUser returns, in the format's fixed on-chain layout.
+type ChainShape struct {
+	Values  responseparser.OnChain
+	Version int
+	// Format is the intent whose format was used (the intent itself, or the
+	// family it inherits from).
+	Format string
+}
+
+// ShapeForChain reads a job's answer into its intent's format with the same
+// parser model and calls as ShapeForUser, and lays it out for the contract
+// (responseparser.EncodeOnChain): processed intelligence, never the raw
+// answer (Ahmed, 2026-10-22).
+//
+// ok is false when there is nothing to deliver this way: the intent has no
+// format, or its format cannot go on-chain (a number without decimals, an
+// on-chain list or object). The job then keeps its miner's YAML mapping. With
+// ok true, err says this answer cannot be delivered: a field was not read
+// (the job tries its next miner instead of sending invented values), or the
+// parser is off or did not answer, which wraps responseparser.ErrUnavailable:
+// the node's failure, never a reason to fall back to a miner's own mapping,
+// whose layout the contract does not know (Ahmed Q8).
+func ShapeForChain(ctx context.Context, intentID, slug, query, body string) (ChainShape, bool, error) {
+	if strings.TrimSpace(intentID) == "" {
+		return ChainShape{}, false, nil
+	}
+	format, version, ok := FormatFor(intentID)
+	if !ok || format.OnChainReady() != nil {
+		return ChainShape{}, false, nil
+	}
+	servedBy := intentID
+	if r, ok := intentformat.For(intentID); ok {
+		servedBy = r.ServedBy
+	}
+	cs := ChainShape{Version: version, Format: servedBy}
+	p := activeResponseParser()
+	if p == nil || !p.UserEnabled() {
+		return cs, true, fmt.Errorf("%w: the response parser is off (PARSER_LLM_ENABLED)", responseparser.ErrUnavailable)
+	}
+	if n := len(body); n > p.MaxBodyChars() {
+		// The miner's answer, not the node: too long to read; the next miner.
+		return cs, true, fmt.Errorf("the answer is %d chars, over PARSER_LLM_MAX_BODY_CHARS=%d", n, p.MaxBodyChars())
+	}
+	// No user waits on a job's answer, so its fields get the scoring timeout
+	// (PARSER_LLM_TIMEOUT_SECONDS), not the API user's 10 s: a field the parser
+	// did not read in time refuses the answer and, for every miner, fails the job.
+	format = format.OnChainOnly()
+	shaped, err := p.ParseAll(ctx, responseparser.ShapeRequest{
+		IntentID: intentID, Body: body, Format: format, User: true, Query: query,
+		Unit: MinerUnitFor(slug), Slug: slug, Timeout: p.ScoringTimeout(),
+	})
+	if err != nil {
+		return cs, true, err
+	}
+	cs.Values, err = responseparser.EncodeOnChain(format, shaped)
+	if err != nil {
+		for i, fl := range format.Fields {
+			if !fl.OffChain && i < len(shaped.Fields) && shaped.Fields[i].Status == responseparser.FieldUnavailable {
+				return cs, true, fmt.Errorf("%w: %v", responseparser.ErrUnavailable, err)
+			}
+		}
+	}
+	return cs, true, err
+}
+
 // ── adapter input ────────────────────────────────────────────────────────────
 
-// AdapterInput is the text a judgment adapter (or a hybrid's wide half) scores
+// AdapterInput is the text a judgment adapter (or a hybrid's model half) scores
 // for one miner answer. By DEFAULT it is the raw answer, unchanged: the
 // adapters were trained on raw miner answers, and feeding them a reshaped
 // object would change every judgment score.

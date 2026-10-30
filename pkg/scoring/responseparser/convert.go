@@ -9,7 +9,8 @@ import (
 // field's unit (the intent's scale is applied later, by the caller, exactly as
 // for the other parse paths).
 //
-// This is where ALL conversion lives; the model never converts.
+// This is where ALL conversion lives; the model never converts (a processed
+// value is the model's own working, still converted here).
 //
 //	number : parse the text (decimal comma aware), then the unit: the field's
 //	         own unit as is, an alias by its multiplier, or "inverse" as 1/x;

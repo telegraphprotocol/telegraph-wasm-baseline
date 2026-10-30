@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """Train a scoring adapter for a judgment or hybrid intent.
 
-The first step of the wide adapter pipeline. It fine-tunes a LoRA Bradley-Terry
+The first step of the Evaluator adapter pipeline. It fine-tunes a LoRA Bradley-Terry
 reward model on ModernBERT-base from preference pairs (a prompt, a better answer,
-a worse answer) and writes the adapter to disk. The other steps:
+a worse answer) and writes the adapter (and its reward head) to disk. The other steps:
 
-    1. train      python -m wide_runtime.train_adapter --intent X --data pairs.jsonl --out runs/X
-    2. convert    python -m wide_runtime.convert_adapter --base answerdotai/ModernBERT-base \
-                      --adapter runs/X/adapter --out runs/X/X.imwq
-    3. package    go run ./cmd/adapterbuild --intent X --imwq runs/X/X.imwq --out runs/X
-    4. register   registerWasm(keccak256, url, "X", feeAddress) with the .wasm from step 3
+    1. train      python -m float_runtime.train_adapter --intent X --data pairs.jsonl --out runs/X
+    2. export     python -m float_runtime.export_adapter --run runs/X --intent X --class judgment \
+                      --foundation foundation/foundation.json
+    3. check      go run ./cmd/adapterbuild lora --intent X --package runs/X/X.safetensors --out runs/X \
+                      --foundation foundation/foundation.json
+    4. register   registerWasm(keccak256, url, "X", feeAddress) with runs/X/X.safetensors
 
 Run every step from the root of this repository.
 
@@ -28,14 +29,18 @@ answers are whole miner response bodies, because that is what the node scores.
 
 What the node fixes, and so this script fixes
 ---------------------------------------------
-- Backbone: ModernBERT only. The node ships one tokenizer
-  and the converter reads ModernBERT weights; another backbone cannot be scored.
+- Backbone: ModernBERT only. The node ships one tokenizer (ModernBERT's), so a
+  model trained on another tokenizer cannot be scored.
   The base model's tokenizer is checked against the node's conformance vectors.
 - Input text: "### Task:\\n<prompt>\\n\\n### Answer:\\n<answer>", the node's
   RenderForJudgment. Training on any other template teaches a different task.
-- Length: the node scores the first 256 tokens (tokenizer.DefaultMaxLen). Training
-  on longer inputs teaches the model to use text it will never see at scoring time,
-  so --max-length defaults to 256.
+- Length: train at the length the node scores. The node tokenises with a 512-token
+  cap (runtime.MaxFloatMaxTokens) and then truncates to the adapter's max_tokens,
+  512 unless the package says less, always keeping the closing [SEP] -- the same
+  truncation the Hugging Face tokenizer does here. So --max-length defaults to 512.
+  If you train shorter (e.g. to fit a small GPU), package with
+  `adapterbuild --max-tokens <same value>` so the node scores exactly what the model
+  learned from; above 512 is pointless, the node never sends more.
 
 Two gates
 ---------
@@ -80,7 +85,7 @@ logging.basicConfig(
 log = logging.getLogger("train_adapter")
 
 DEFAULT_BASE = "answerdotai/ModernBERT-base"
-NODE_MAX_LEN = 256  # the node's tokenizer.DefaultMaxLen
+NODE_MAX_LEN = 512  # the node's runtime.MaxFloatMaxTokens (= DefaultFloatMaxTokens)
 
 # The node's tokenizer conformance vectors (Telegraph pkg/wasm/tokenizer/testdata).
 TOKENIZER_VECTORS = Path(__file__).resolve().parent / "testdata" / "tokenizer_vectors.json"
@@ -433,8 +438,8 @@ class PairCollator:
 
 def build_model(base_model: str, hp: Hyperparams):
     """ModernBERT with a one-logit sequence-classification head and LoRA on the
-    attention and MLP projections. The head is trained in full (modules_to_save),
-    which is what convert_adapter merges back."""
+    attention and MLP projections. The head is trained in full (modules_to_save)
+    and exported with the deltas (export_adapter)."""
     import torch
     from peft import LoraConfig, TaskType, get_peft_model
     from transformers import AutoConfig, AutoModelForSequenceClassification, AutoTokenizer
@@ -538,6 +543,45 @@ def evaluate(model, tok, pairs, hp: Hyperparams, train_negatives: Optional[set] 
     return report
 
 
+def save_reward_head(model, adapter_dir: Path) -> None:
+    """Write the reward head (the one-logit classifier: weight [1, H], bias [1]) next to the
+    PEFT adapter as reward_head.pt. PEFT saves it too (modules_to_save), but the delta
+    package (export_adapter) must never depend on PEFT's naming of it."""
+    import torch
+    head = None
+    for name, m in model.named_modules():
+        if isinstance(m, torch.nn.Linear) and m.out_features == 1 and (
+                name.endswith("classifier") or name.endswith("classifier.modules_to_save.default")
+                or name.endswith("score")):
+            head = m
+    if head is None:
+        raise TrainError("no one-logit classifier head found to save as reward_head.pt")
+    sd = {"weight": head.weight.detach().float().cpu()}
+    if head.bias is not None:
+        sd["bias"] = head.bias.detach().float().cpu()
+    torch.save(sd, adapter_dir / "reward_head.pt")
+
+
+def foundation_record(base_model: str) -> dict:
+    """What an adapter was trained against: the base model, the sha256 of its weights file
+    and of its tokenizer.json (the node's pinned tokenizer digest), for the run record and
+    the delta package."""
+    import hashlib
+    out = {"base_model": base_model}
+    try:
+        from huggingface_hub import hf_hub_download
+        for key, fname in (("base_model_sha256", "model.safetensors"), ("tokenizer_sha256", "tokenizer.json")):
+            p = Path(base_model) / fname if Path(base_model).is_dir() else Path(hf_hub_download(base_model, fname))
+            h = hashlib.sha256()
+            with open(p, "rb") as f:
+                for chunk in iter(lambda: f.read(1 << 20), b""):
+                    h.update(chunk)
+            out[key] = h.hexdigest()
+    except Exception as e:  # noqa: BLE001 - informational; the package check is the gate
+        log.warning("could not hash the base model files: %s", e)
+    return out
+
+
 def train(base_model, train_pairs, val_pairs, adapter_dir: Path, hp: Hyperparams):
     """Train, keeping the best epoch's adapter on disk. Returns (model, tok)."""
     import torch
@@ -568,6 +612,7 @@ def train(base_model, train_pairs, val_pairs, adapter_dir: Path, hp: Hyperparams
     def save():
         model.save_pretrained(adapter_dir)
         tok.save_pretrained(adapter_dir)
+        save_reward_head(model, adapter_dir)
 
     lower_better = hp.es_metric == "val_loss"
     best, best_epoch, no_improve, epoch = (math.inf if lower_better else -math.inf), -1, 0, -1
@@ -640,7 +685,7 @@ def build_argparser() -> argparse.ArgumentParser:
     hp = Hyperparams()
     p = argparse.ArgumentParser(
         description="Train a ModernBERT LoRA reward-model adapter for a judgment or hybrid "
-                    "intent. Convert the result with wide_runtime.convert_adapter.",
+                    "intent. Export the result with float_runtime.export_adapter.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--intent", required=True, help="intent the adapter scores, e.g. CODE_REVIEW")
@@ -669,7 +714,7 @@ def build_argparser() -> argparse.ArgumentParser:
 
     g = p.add_argument_group("hyperparameters")
     for name, typ, help_ in [
-        ("max_length", int, "tokens per answer; the node scores 256"),
+        ("max_length", int, "tokens per rendered prompt+answer; the node scores at most 512"),
         ("batch_size", int, None), ("grad_accum", int, None),
         ("lora_rank", int, None), ("lora_alpha", int, None), ("lora_dropout", float, None),
         ("epochs", int, None), ("lr", float, None), ("weight_decay", float, None),
@@ -761,8 +806,9 @@ def main(argv=None) -> int:
         report = evaluate(model, tok, gate_set, hp, train_negatives)
         result = {
             "intent": args.intent,
-            "base_model": args.base_model,
+            **foundation_record(args.base_model),
             "adapter_dir": str(adapter_dir),
+            "reward_head": str(adapter_dir / "reward_head.pt"),
             "train_pairs": len(train_pairs),
             "gate_split": gate_name,
             "dataset_gate": rep,
@@ -784,11 +830,13 @@ def main(argv=None) -> int:
     if result["verdict"] != "PASS":
         log.error("evaluation gate FAILED: %s", result.get("fail_reason", ""))
         return 1
-    imwq = out / f"{args.intent}.imwq"
-    print("\nNext:\n"
-          f"  python -m wide_runtime.convert_adapter "
-          f"--base {args.base_model} --adapter {adapter_dir} --out {imwq}\n"
-          f"  go run ./cmd/adapterbuild --intent {args.intent} --imwq {imwq} --out {out}")
+    max_tokens = "" if hp.max_length >= NODE_MAX_LEN else f" --max-tokens {hp.max_length}"
+    deltapkg = (out / (args.intent + ".safetensors")).as_posix()
+    print("\nNext (shared Foundation Model, safetensors delta package):\n"
+          f"  python -m float_runtime.export_adapter --run {out.as_posix()} --intent {args.intent} "
+          f"--class <judgment|hybrid> --foundation <foundation.json>{max_tokens}\n"
+          f"  go run ./cmd/adapterbuild lora --intent {args.intent} --package {pkg} "
+          f"--foundation <foundation.json> --out {out.as_posix()}")
     return 0
 
 

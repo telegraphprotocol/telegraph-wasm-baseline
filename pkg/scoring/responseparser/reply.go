@@ -52,6 +52,42 @@ func StripThinking(content string) string {
 // through float (1.10 -> "1.1"). The number is the same; keeping the written
 // text is what the verbatim guard wants to compare.
 func ParseReply(content string) (Copied, bool) {
+	m, ok := decodeReply(content)
+	if !ok {
+		return Copied{}, false
+	}
+	v, has := m["value"]
+	if !has {
+		return Copied{}, false
+	}
+	return copiedOf(v), true
+}
+
+// ParseProcessedReply reads a processed field's reply, {"value": ..., "from":
+// [...]}: the value as ParseReply reads it, and the values the model says it
+// used, as text.
+func ParseProcessedReply(content string) (Copied, []string, bool) {
+	m, ok := decodeReply(content)
+	if !ok {
+		return Copied{}, nil, false
+	}
+	v, has := m["value"]
+	if !has {
+		return Copied{}, nil, false
+	}
+	var from []string
+	if items, isList := m["from"].([]any); isList {
+		for _, item := range items {
+			if t := listItemText(item); t != "" {
+				from = append(from, t)
+			}
+		}
+	}
+	return copiedOf(v), from, true
+}
+
+// decodeReply decodes the reply's JSON object.
+func decodeReply(content string) (map[string]any, bool) {
 	s := fenceRE.ReplaceAllString(strings.TrimSpace(content), "")
 	candidate := s
 	if m := objectRE.FindString(s); m != "" {
@@ -61,36 +97,34 @@ func ParseReply(content string) (Copied, bool) {
 	dec.UseNumber()
 	var obj any
 	if err := dec.Decode(&obj); err != nil {
-		return Copied{}, false
+		return nil, false
 	}
 	// json.loads rejects trailing data; so must we.
 	if rest := strings.TrimSpace(candidate[dec.InputOffset():]); rest != "" {
-		return Copied{}, false
+		return nil, false
 	}
 	m, isMap := obj.(map[string]any)
-	if !isMap {
-		return Copied{}, false
-	}
-	v, has := m["value"]
-	if !has {
-		return Copied{}, false
-	}
+	return m, isMap
+}
+
+// copiedOf reads the reply's "value".
+func copiedOf(v any) Copied {
 	switch x := v.(type) {
 	case nil:
-		return Copied{Kind: CopiedNone}, true
+		return Copied{Kind: CopiedNone}
 	case string:
 		t := strings.TrimSpace(x)
 		switch strings.ToLower(t) {
 		case "", "null", "none":
-			return Copied{Kind: CopiedNone}, true
+			return Copied{Kind: CopiedNone}
 		}
-		return Copied{Kind: CopiedText, Text: t}, true
+		return Copied{Kind: CopiedText, Text: t}
 	case []any:
 		out := make([]string, 0, len(x))
 		for _, item := range x {
 			out = append(out, listItemText(item))
 		}
-		return Copied{Kind: CopiedList, List: out}, true
+		return Copied{Kind: CopiedList, List: out}
 	case map[string]any:
 		out := make(map[string]*string, len(x))
 		for k, item := range x {
@@ -101,9 +135,9 @@ func ParseReply(content string) (Copied, bool) {
 			t := objectItemText(item)
 			out[k] = &t
 		}
-		return Copied{Kind: CopiedObject, Object: out}, true
+		return Copied{Kind: CopiedObject, Object: out}
 	default:
-		return Copied{Kind: CopiedText, Text: scalarText(x)}, true
+		return Copied{Kind: CopiedText, Text: scalarText(x)}
 	}
 }
 

@@ -6,6 +6,7 @@
 # The engine build inputs (crate, lock, toolchain pin, script) must check out byte-identical
 # on every OS, and the shell scripts must run under bash on Linux.
 float_runtime/engine/** text eol=lf
+float_runtime/engine/*.wasm binary
 *.sh text eol=lf
 *.py text eol=lf
 float_runtime/testdata/*.json text eol=lf
