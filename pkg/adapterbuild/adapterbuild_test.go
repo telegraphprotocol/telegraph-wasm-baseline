@@ -68,6 +68,10 @@ func TestResolveClass(t *testing.T) {
 		{"EMAIL_SECURITY", "", "hybrid"},
 		{"CODE_REVIEW", "", "judgment"},
 		{"CODE_REVIEW", "judgment", "judgment"},
+		// not in the compiled-in list, but live judgment/hybrid prefixes: an explicit class stands
+		{"WEATHER_FORECAST_VERIFY", "judgment", "judgment"},
+		{"WEATHER_FORECAST_VERIFY_GENERAL", "judgment", "judgment"},
+		{"NOT_AN_INTENT", "hybrid", "hybrid"},
 	}
 	for _, c := range ok {
 		got, err := ResolveClass(c.intent, c.explicit)
@@ -81,6 +85,9 @@ func TestResolveClass(t *testing.T) {
 		{"FX_NOW", "", "deterministic"},
 		{"ROUTE_ETA", "hybrid", "deterministic"},
 		{"NOT_AN_INTENT", "", "not a judgment or hybrid intent"},
+		{"WEATHER_FORECAST_VERIFY", "", "pass --class judgment"},
+		{"NOT_AN_INTENT", "deterministic", "not a judgment or hybrid intent"},
+		{"FX_NOW", "judgment", "deterministic"},
 		{"", "", "intent is required"},
 	}
 	for _, c := range bad {
