@@ -510,3 +510,17 @@ func InputHash(ids []int64) string {
 	sum := sha256.Sum256(EncodeFloatInput(ids))
 	return hex.EncodeToString(sum[:])
 }
+
+// InputRoot binds a set of scored inputs: the sha256 of the sorted leaves
+// (each naming one input, e.g. "<child>:<row_hash>:<InputHash>"), joined by
+// newlines. Order-independent, so every validator computes the same root for
+// the same set; "" for no leaves.
+func InputRoot(leaves []string) string {
+	if len(leaves) == 0 {
+		return ""
+	}
+	s := append([]string(nil), leaves...)
+	sort.Strings(s)
+	sum := sha256.Sum256([]byte(strings.Join(s, "\n")))
+	return hex.EncodeToString(sum[:])
+}

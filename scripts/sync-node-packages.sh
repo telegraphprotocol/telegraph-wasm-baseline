@@ -9,15 +9,15 @@
 # literals such as the float host's random seed "telegraph/float-adapter/random/v1", and the
 # kit would then verify packages under a different host than the node runs.
 #
-# The package list is what `go list -deps ./cmd/adapterbuild` reaches inside the module; if
-# adapterbuild starts importing another node package, add it here.
+# The package list is what `go list -deps ./cmd/adapterbuild ./cmd/adapterexec` reaches inside the module; if
+# either starts importing another node package, add it here.
 set -euo pipefail
 KIT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 NODE="${1:-$KIT/../Telegraph}"
 REF="${2:-HEAD}"
 MOD="github.com/telegraphprotocol/telegraph-wasm-baseline"
 PKGS="pkg/scoring/family pkg/wasm/wasmbin pkg/wasm/runtime pkg/scoring/catalog pkg/scoring/fetchspec
-pkg/engine/llm pkg/scoring/responseparser pkg/scoring/intentformat pkg/scoring/comparator"
+pkg/engine/llm pkg/scoring/responseparser pkg/scoring/intentformat pkg/scoring/comparator pkg/wasm/remote"
 
 git -C "$NODE" rev-parse --verify -q "$REF^{commit}" >/dev/null || { echo "no commit $REF in $NODE" >&2; exit 1; }
 echo "syncing from $NODE @ $(git -C "$NODE" rev-parse --short "$REF")" >&2

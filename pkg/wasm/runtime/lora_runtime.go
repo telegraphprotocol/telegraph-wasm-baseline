@@ -41,11 +41,16 @@ func NewLoRARuntime(ctx context.Context, f *Foundation, pkg []byte, wantClass st
 	if err != nil {
 		return nil, fmt.Errorf("wasm/runtime: foundation: %w", err)
 	}
-	_, lerr := inst.ensureAdapter(ctx, f, rt)
-	if lerr != nil && inst.mod.IsClosed() {
-		inst.kill()
-	}
-	f.release(inst)
+	limit := FloatScoreTimeout()
+	callCtx, cancel := context.WithTimeout(ctx, limit)
+	defer cancel()
+	lerr := f.guard(ctx, callCtx, limit, inst, fnLoadAdapter, func() error {
+		_, err := inst.ensureAdapter(callCtx, f, rt)
+		if err != nil && inst.mod.IsClosed() {
+			inst.kill()
+		}
+		return err
+	})
 	if lerr != nil {
 		return nil, fmt.Errorf("wasm/runtime: lora adapter: %w", lerr)
 	}

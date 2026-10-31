@@ -45,8 +45,10 @@ import (
 //
 // Host: a fixed WASI host (no FS, no
 // args, fixed clocks and random source, capped stdio), the same memory cap,
-// and the per-score deadline (ADAPTER_SCORE_TIMEOUT). Scores are serialised
-// per instance; FOUNDATION_POOL_SIZE instances (default 1) exist per process.
+// and the per-score deadline (ADAPTER_SCORE_TIMEOUT, enforced per
+// FOUNDATION_INTERRUPT). Scores are serialised
+// per instance; FOUNDATION_POOL_SIZE instances exist per process (unset:
+// DefaultPoolSize, 1 off Linux).
 const (
 	FoundationABIVersion = 2
 
@@ -79,6 +81,15 @@ const (
 	// reloaded from its validated package on its next score. A delta is never
 	// retained past the bound.
 	FoundationDeltaCacheMaxEnv   = "FOUNDATION_DELTA_CACHE_MAX"
+	// FoundationInterruptEnv picks how the per-score deadline is enforced:
+	// "watchdog" (default) times the call from the host and abandons it past
+	// the deadline; "loop" compiles wazero's termination check into every guest
+	// loop, which stops the call in place but makes every score ~4x slower.
+	// Scores are bit-identical either way.
+	FoundationInterruptEnv = "FOUNDATION_INTERRUPT"
+	InterruptWatchdog      = "watchdog"
+	InterruptLoop          = "loop"
+
 	FoundationDeltaCacheBytesEnv = "FOUNDATION_DELTA_CACHE_BYTES"
 	DefaultDeltaCacheMax         = 16
 	DefaultDeltaCacheBytes       = int64(512) << 20
@@ -133,6 +144,8 @@ type FoundationConfig struct {
 	// also what a worker costs the OS; tests with the stub foundation use a
 	// small one.
 	MemoryLimitPages uint32
+	// LoopInterrupt selects FOUNDATION_INTERRUPT=loop (false = watchdog).
+	LoopInterrupt bool
 }
 
 // DefaultPoolSize is the worker count when FOUNDATION_POOL_SIZE is unset:
@@ -217,6 +230,13 @@ func FoundationConfigFromEnv(tokenizerHash string) (FoundationConfig, error) {
 		}
 		c.PoolSize = n
 	}
+	switch v := strings.ToLower(strings.TrimSpace(os.Getenv(FoundationInterruptEnv))); v {
+	case "", InterruptWatchdog:
+	case InterruptLoop:
+		c.LoopInterrupt = true
+	default:
+		return c, fmt.Errorf("%s=%q: want %q or %q", FoundationInterruptEnv, v, InterruptWatchdog, InterruptLoop)
+	}
 	if v := strings.TrimSpace(os.Getenv(FoundationDeltaCacheMaxEnv)); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil || n < 1 {
@@ -271,12 +291,15 @@ type Foundation struct {
 
 	instancesBuilt atomic.Int64
 
-	// beforeScore, when set (tests only), runs after the per-score deadline is
-	// armed and before the engine is called: a stand-in for a slow engine.
-	beforeScore    func()
+	// beforeCall, when set (tests only), runs after the deadline is armed and
+	// before a guarded engine call (score or adapter load): a slow engine.
+	beforeCall     func()
 	peakMemory     atomic.Uint64
 	cacheLoads     atomic.Int64
 	cacheEvictions atomic.Int64
+
+	stuck      atomic.Int64  // workers swapped out while their abandoned call runs
+	stuckGrace time.Duration // tests only; 0 = the score deadline
 }
 
 // foundationInstance is one engine instance with the foundation loaded and
@@ -349,7 +372,7 @@ func LoadFoundation(ctx context.Context, cfg FoundationConfig) (*Foundation, err
 	if limit == 0 {
 		limit = FoundationMemoryLimitPages
 	}
-	wrt := wazero.NewRuntimeWithConfig(ctx, foundationRuntimeConfig(limit))
+	wrt := wazero.NewRuntimeWithConfig(ctx, foundationRuntimeConfig(limit, cfg.LoopInterrupt))
 	if _, err := wasi_snapshot_preview1.Instantiate(ctx, wrt); err != nil {
 		wrt.Close(ctx) //nolint:errcheck
 		return nil, fmt.Errorf("wasm/runtime: instantiating the WASI host: %w", err)
@@ -433,9 +456,9 @@ func CheckFoundationEngine(b []byte) (FloatModuleInfo, error) {
 	return info, nil
 }
 
-func foundationRuntimeConfig(limitPages uint32) wazero.RuntimeConfig {
+func foundationRuntimeConfig(limitPages uint32, loopInterrupt bool) wazero.RuntimeConfig {
 	return cachedRuntimeConfig().
-		WithCloseOnContextDone(true).
+		WithCloseOnContextDone(loopInterrupt).
 		WithMemoryLimitPages(limitPages).
 		WithMemoryCapacityFromMax(true)
 }
@@ -595,6 +618,14 @@ func (f *Foundation) TokenizerHash() string { return f.cfg.TokenizerSH }
 // Spec is the LoRA input layout the engine reported.
 func (f *Foundation) Spec() FoundationSpec { return f.spec }
 
+// Interrupt is how the per-score deadline is enforced (FOUNDATION_INTERRUPT).
+func (f *Foundation) Interrupt() string {
+	if f.cfg.LoopInterrupt {
+		return InterruptLoop
+	}
+	return InterruptWatchdog
+}
+
 // PoolSize is how many engine instances hold the foundation.
 func (f *Foundation) PoolSize() int { return f.cfg.PoolSize }
 
@@ -749,19 +780,117 @@ func loraGuestReason(msg string) string {
 }
 
 // score runs one score of rt on ids, in one instance, under the per-score
-// deadline. A trap or a timed-out call kills the instance (rebuilt lazily).
+// deadline (see guard). A trap kills the instance (rebuilt lazily).
 func (f *Foundation) score(ctx context.Context, rt *LoRARuntime, ids []int64) (ModelScore, error) {
 	inst, err := f.acquire(ctx)
 	if err != nil {
 		return ModelScore{}, fmt.Errorf("wasm/runtime: foundation: %w", err)
 	}
-	defer f.release(inst)
 	limit := FloatScoreTimeout()
 	callCtx, cancel := context.WithTimeout(ctx, limit)
 	defer cancel()
-	if f.beforeScore != nil {
-		f.beforeScore()
+	var s ModelScore
+	err = f.guard(ctx, callCtx, limit, inst, fnScore, func() error {
+		var e error
+		s, e = f.scoreIn(ctx, callCtx, limit, inst, rt, ids)
+		return e
+	})
+	if err != nil {
+		return ModelScore{}, err
 	}
+	return s, nil
+}
+
+// guard runs fn (guest calls on inst, which the caller acquired) under
+// callCtx's deadline and returns inst to the pool. Loop interrupt: wazero
+// stops fn in place. Watchdog: past the deadline fn is abandoned and the
+// caller gets the error at once; inst rejoins the pool when fn ends, or is
+// replaced by a fresh worker if fn is still running a grace period later
+// (watchAbandoned).
+func (f *Foundation) guard(ctx, callCtx context.Context, limit time.Duration, inst *foundationInstance, what string, fn func() error) error {
+	run := fn
+	if f.beforeCall != nil {
+		run = func() error { f.beforeCall(); return fn() }
+	}
+	if f.cfg.LoopInterrupt {
+		err := run()
+		f.release(inst)
+		return err
+	}
+	done := make(chan error, 1)
+	go func() { done <- run() }()
+	select {
+	case err := <-done:
+		f.release(inst)
+		return err
+	case <-callCtx.Done():
+		go f.watchAbandoned(inst, done, what, time.Now())
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return fmt.Errorf("wasm/runtime: foundation %s stopped: %w", what, ctxErr)
+		}
+		return fmt.Errorf("%w: %w: %s did not finish within %s (%s; abandoned by the %s)", ErrFloatGuest, ErrScoreTimeout, what, limit, ScoreTimeoutEnv, InterruptWatchdog)
+	}
+}
+
+// watchAbandoned waits for an abandoned call. Ending within the grace period
+// (the score deadline), its worker rejoins the pool. Still running after it,
+// the worker is swapped for a placeholder that the next acquire rebuilds, so
+// scoring and shutdown never wait on it; its module is closed when (if) the
+// call ends. At most PoolSize workers are swapped out at once (each keeps its
+// memory until its call ends); past that the stuck worker stays out of the
+// pool until its call ends.
+func (f *Foundation) watchAbandoned(inst *foundationInstance, done <-chan error, what string, since time.Time) {
+	grace := f.stuckGrace
+	if grace <= 0 {
+		grace = FloatScoreTimeout()
+	}
+	t := time.NewTimer(grace)
+	defer t.Stop()
+	select {
+	case <-done:
+		log.Warn().Str("call", what).Dur("after_deadline", time.Since(since)).
+			Msg("[foundation] abandoned call ended; its worker is back in the pool")
+		f.release(inst)
+		return
+	case <-t.C:
+	}
+	replaced := f.replaceStuck(inst)
+	log.Error().Str("call", what).Dur("after_deadline", time.Since(since)).Bool("replaced", replaced).
+		Int64("stuck_workers", f.stuck.Load()).Int("pool", f.cfg.PoolSize).
+		Msg("[foundation] abandoned call is still running: a fresh worker replaces it (replaced=false: the stuck-worker cap is reached and the pool runs one worker short). It keeps a CPU core and its memory until it ends; restart the node or set " + FoundationInterruptEnv + "=" + InterruptLoop + " if this repeats")
+	<-done
+	log.Warn().Str("call", what).Dur("after_deadline", time.Since(since)).
+		Msg("[foundation] stuck call ended")
+	if replaced {
+		inst.mod.Close(context.Background()) //nolint:errcheck
+		f.stuck.Add(-1)
+		return
+	}
+	f.release(inst)
+}
+
+// replaceStuck puts a dead placeholder in inst's place (rebuilt by the next
+// acquire), unless the foundation is closed or PoolSize workers are already
+// swapped out.
+func (f *Foundation) replaceStuck(inst *foundationInstance) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.closed || f.stuck.Load() >= int64(f.cfg.PoolSize) {
+		return false
+	}
+	ph := &foundationInstance{dead: true, handles: map[*LoRARuntime]*cachedDelta{}}
+	for i, old := range f.all {
+		if old == inst {
+			f.all[i] = ph
+		}
+	}
+	f.stuck.Add(1)
+	f.free <- ph // inst is out of the pool, so there is room
+	return true
+}
+
+// scoreIn is one score's guest calls on inst, which the caller holds.
+func (f *Foundation) scoreIn(ctx, callCtx context.Context, limit time.Duration, inst *foundationInstance, rt *LoRARuntime, ids []int64) (ModelScore, error) {
 
 	h, err := inst.ensureAdapter(callCtx, f, rt)
 	if err != nil {
@@ -858,15 +987,30 @@ func (f *Foundation) Close(ctx context.Context) error {
 	f.closed = true
 	n := len(f.all)
 	f.mu.Unlock()
+	wait := time.NewTimer(foundationCloseWait)
+	defer wait.Stop()
 	for i := 0; i < n; i++ {
-		inst := <-f.free
-		inst.mod.Close(ctx) //nolint:errcheck
+		select {
+		case inst := <-f.free:
+			if inst.mod != nil {
+				inst.mod.Close(ctx) //nolint:errcheck
+			}
+		case <-wait.C:
+			// An abandoned call still holds a worker: leave the runtime to the
+			// process exit rather than close it under a running call.
+			log.Warn().Int("busy_workers", n-i).Dur("waited", foundationCloseWait).
+				Msg("[foundation] close: workers still busy; not waiting for them")
+			return nil
+		}
 	}
 	if f.wrt != nil {
 		return f.wrt.Close(ctx)
 	}
 	return nil
 }
+
+// foundationCloseWait bounds how long Close waits for busy workers.
+var foundationCloseWait = 30 * time.Second
 
 // The process-wide active foundation: loaded once at startup (main.go) and
 // read by Stage 1, the installer and the loader. Nil when the node runs none.
