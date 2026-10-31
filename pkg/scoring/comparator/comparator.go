@@ -21,31 +21,22 @@
 // WASM, every validator that derives the same two integers gets a bit-identical
 // score. Anything that fetches, parses or rounds therefore has to live here.
 //
-// Scope today is FX_NOW, ROUTE_ETA and ONCHAIN_METRIC_VERIFY. Everything an
-// intent needs to be scored
-// — its comparator spec, its fixed-point scale, the fixed question set, the
-// question text, and its per-miner parsers — is registered in one place
-// (intentConfigs below), so adding a third intent is a data change here plus a
-// truth source, not a change to the scoring pass.
-//
-// The per-miner parsers remain deliberate scaffolding. Parser count grows with
-// *miners* (1,340 registered), not intents (134), and ROUTE_ETA makes the cost
-// concrete: five of its six scoreable miners are the same OSRM endpoint and
-// differ only in a registered default, so they need one parser repeated five
-// times. This should move to a declarative response mapping carried in the
-// miner's registration YAML — miner_registry.yaml_raw already holds the whole
-// YAML, so no schema change is needed — the way semantics.signal_mapping
-// already describes the request side.
+// Everything an intent needs to be scored — its comparator spec, its
+// fixed-point scale, the fixed question set and the question text — is data:
+// the intent's spec (on chain, mirrored into intent_specs; intentConfigs below
+// is only the compiled-in fallback). No miner is named here: every miner
+// registered for an intent is asked, and its answer is read by the parser
+// model against the intent's response format (response_format.go), so a new
+// miner is scored from its first answer without a code change.
 package comparator
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"math"
 	"sort"
-	"strconv"
 	"strings"
+	"sync/atomic"
 
 	"github.com/telegraphprotocol/telegraph-wasm-baseline/pkg/scoring/responseparser"
 )
@@ -196,7 +187,7 @@ const ScaleAssetReserve = 1
 // up as a wrong score (RelTol divides by the truth, so it is scale-agnostic),
 // it shows up as disagreement with the artifact's documented domain.
 func ScaleFor(intentID string) (float64, bool) {
-	c, ok := intentConfigs[intentID]
+	c, ok := configs()[intentID]
 	if !ok {
 		return 0, false
 	}
@@ -304,7 +295,7 @@ type IntentConfig struct {
 
 // IsHybrid reports whether an intent is scored by the model-bearing path.
 func IsHybrid(intentID string) bool {
-	c, ok := intentConfigs[intentID]
+	c, ok := configs()[intentID]
 	return ok && c.Fusion != nil
 }
 
@@ -580,13 +571,13 @@ var intentConfigs = map[string]IntentConfig{
 
 // ConfigFor returns an intent's full comparator configuration.
 func ConfigFor(intentID string) (IntentConfig, bool) {
-	c, ok := intentConfigs[intentID]
+	c, ok := configs()[intentID]
 	return c, ok
 }
 
 // SpecFor returns the comparator spec for an intent.
 func SpecFor(intentID string) (Spec, bool) {
-	c, ok := intentConfigs[intentID]
+	c, ok := configs()[intentID]
 	if !ok {
 		return Spec{}, false
 	}
@@ -595,7 +586,7 @@ func SpecFor(intentID string) (Spec, bool) {
 
 // KeysFor returns the fixed question set an intent is scored on.
 func KeysFor(intentID string) ([]string, bool) {
-	c, ok := intentConfigs[intentID]
+	c, ok := configs()[intentID]
 	if !ok {
 		return nil, false
 	}
@@ -609,7 +600,7 @@ func KeysFor(intentID string) ([]string, bool) {
 // path is actually *wired* — a deterministic intent with no spec and no parsers
 // here would otherwise fall through to a comparison of two zero values.
 func IsDeterministic(intentID string) bool {
-	_, ok := intentConfigs[intentID]
+	_, ok := configs()[intentID]
 	return ok
 }
 
@@ -620,12 +611,26 @@ func IsDeterministic(intentID string) bool {
 // edited every time an intent is ported is one that gets edited rather than
 // heeded.
 func DeterministicIntents() []string {
-	out := make([]string, 0, len(intentConfigs))
-	for id := range intentConfigs {
+	cfgs := configs()
+	out := make([]string, 0, len(cfgs))
+	for id := range cfgs {
 		out = append(out, id)
 	}
 	sort.Strings(out)
 	return out
+}
+
+// liveConfigs is the table UseSpecs installed; nil until then, which leaves
+// the compiled-in intentConfigs in force. Swapped atomically because the
+// catalog is reloaded every epoch while asks read it concurrently.
+var liveConfigs atomic.Pointer[map[string]IntentConfig]
+
+// configs is the intent config table in force.
+func configs() map[string]IntentConfig {
+	if p := liveConfigs.Load(); p != nil {
+		return *p
+	}
+	return intentConfigs
 }
 
 // fxQuestion is the question put to every miner for one currency pair.
@@ -642,34 +647,18 @@ func fxQuestion(quote string) string {
 
 // ParseMinerValue extracts the scored quantity from one miner's raw response.
 //
-// The response arrives as the JSON string that extractAnswerText produced: for
-// these non-LLM miners it is the upstream body marshalled back to text, so the
-// parsers below read the provider's own schema directly rather than trying to
-// read a number out of prose.
+// There is ONE reader for every miner of every intent: the parser model, with
+// the intent's response format (response_format.go). No miner is named in
+// code: a new miner is read the same way as every other from its first answer.
+// The hand-written per-miner parsers, and the per-miner coverage lists that
+// decided which miners were asked at all, were removed for exactly that
+// reason: a miner they did not name was never asked, so never ranked.
 //
-// Parsing deliberately happens per miner. The ten FX_NOW providers share no
-// response shape — keys differ in case and nesting, values arrive as both JSON
-// numbers and strings, one uses a comma decimal separator, and three quote a
-// base other than USD. A single configured value_path cannot express that,
-// which is why the reference doc's ".rate" matches none of them. ROUTE_ETA is
-// the opposite shape and no better served by one path: five of its six miners
-// return the identical OSRM envelope and the sixth returns a duration *matrix*.
-//
-// Parsers are scoped per intent rather than keyed by slug alone. Slugs are not
-// guaranteed unique across intents — the registry already contains
-// byte-identical registrations under two different intents — so a flat map
-// would let one intent's parser silently claim another's miner.
-//
-// Order of the parse paths:
-//
-//  1. the intent's response_format, read by the parser model — only when a
-//     parser is installed (PARSER_LLM_ENABLED=true) and the intent has a
-//     format; see response_format.go
-//  2. the miner's declared mapping (registration YAML)
-//  3. the hand-written parser for the slug
-//
-// A failure on path 1 is final (not scored, never 0), except when the model
-// never answered, which falls through to 2 and 3.
+// No answer is ever read as 0 for want of a reader: with no parser installed
+// (PARSER_LLM_ENABLED unset), no format for the intent, or no value the model
+// can find in the reply, the miner is left out of that question, not scored 0.
+// That is also how a miner that cannot answer a question (a single-currency
+// feed asked another currency) drops out of it.
 func ParseMinerValue(intentID, slug, key, body string) (float64, error) {
 	return ParseMinerValueCtx(context.Background(), intentID, slug, key, body)
 }
@@ -681,56 +670,17 @@ func ParseMinerValueCtx(ctx context.Context, intentID, slug, key, body string) (
 	if strings.TrimSpace(body) == "" {
 		return 0, fmt.Errorf("miner %q returned an empty response", slug)
 	}
-	if v, handled, err := parseViaResponseFormat(ctx, intentID, slug, key, body); handled {
-		if err != nil {
-			return 0, err
-		}
-		return checkMinerValue(intentID, slug, v)
-	}
-	return parseLegacy(intentID, slug, key, body)
-}
-
-// parseLegacy is the per-miner path: declared mapping, then hardcoded parser.
-func parseLegacy(intentID, slug, key, body string) (float64, error) {
-	if strings.TrimSpace(body) == "" {
-		return 0, fmt.Errorf("miner %q returned an empty response", slug)
-	}
-
-	// A miner's OWN declaration wins over a parser we wrote for it.
-	//
-	// This is the direction the code is moving: the mapping is in the
-	// registration YAML the miner already ships, so a new miner is a
-	// registration rather than a rebuild. The hardcoded parsers remain as a
-	// fallback only while the two paths are being proved equal (see
-	// TestDeclarativeParityWithHardcodedParsers); once parity holds they go.
-	if m, ok := MinerMappingFor(slug); ok {
-		v, err := ParseWithMapping(m, body)
-		if err != nil {
-			return 0, fmt.Errorf("parsing %s response via its declared mapping: %w", slug, err)
-		}
-		return checkMinerValue(intentID, slug, v)
-	}
-
-	byslug, ok := parsersByIntent[intentID]
-	if !ok {
-		return 0, fmt.Errorf("no parsers registered for intent %q", intentID)
-	}
-	p, ok := byslug[slug]
-	if !ok {
-		return 0, fmt.Errorf("no %s parser registered for miner %q", intentID, slug)
-	}
-	v, err := p(key, body)
+	v, err := parseViaResponseFormat(ctx, intentID, slug, key, body)
 	if err != nil {
-		return 0, fmt.Errorf("parsing %s response: %w", slug, err)
+		return 0, err
 	}
 	return checkMinerValue(intentID, slug, v)
 }
 
 // checkMinerValue rejects a value the comparator cannot use.
 //
-// Shared by both the declarative and hardcoded paths so the two cannot drift
-// on what counts as usable — a difference there would show up as one path
-// scoring a miner and the other excluding it, for the same response.
+// Shared by miner answers and truth-source answers (ParseSourceValue) so the
+// two cannot drift on what counts as usable.
 //
 // Zero is admitted for a PASS_FAIL intent and rejected everywhere else, which
 // is the per-intent rule this function's earlier comment called for. For a
@@ -770,387 +720,13 @@ func allowsZero(intentID string) bool {
 	return ok && cfg.Spec.Code == CmpPassFail
 }
 
-// ParseMinerRate extracts a USD->quote rate from one FX_NOW miner's response.
-//
-// Retained as FX_NOW's named entry point; ParseMinerValue is the general form.
-// The quote is upper-cased here because FX_NOW's parsers key on currency codes.
-func ParseMinerRate(slug, quote, body string) (float64, error) {
-	return ParseMinerValue("FX_NOW", slug, strings.ToUpper(quote), body)
-}
+// âââââââââââââââââââââââââââââââ compiled-in FX keys ââââââââââââââââââââââââââââââ
 
-// parserFunc reads the scored quantity out of one provider's response body.
-// The key is the intent's question key: a currency code for FX_NOW, a route ID
-// for ROUTE_ETA.
-type parserFunc func(key, body string) (float64, error)
-
-// parsersByIntent holds one parser per registered miner, per intent.
-var parsersByIntent = map[string]map[string]parserFunc{
-	"ASSET_RESERVE_ATTESTATION": reserveParsers,
-	"FX_NOW":                    parsers,
-	"ROUTE_ETA":                 routeParsers,
-	"ONCHAIN_METRIC_VERIFY":     onchainParsers,
-	"LIQUIDITY_DEPTH_VERIFY":    liquidityParsers,
-	"MINING_HASHPRICE_VERIFY":   hashpriceParsers,
-	"GRID_POWER_PRICE":          gridParsers,
-	"MACRO_ECONOMIC_INDICATOR":  macroParsers,
-	"LIVE_SHELF_PRICE":          shelfParsers,
-}
-
-// parsers holds one entry per registered FX_NOW miner, keyed by the slug in
-// miner_registry. Registration IDs 1397-1406 as listed in ALL_INTENT_MINERS.xlsx.
-//
-// Note that four of these providers cannot answer an arbitrary USD pair at all:
-// fx-boc quotes only USD/CAD, fx-riksbank only SEK crosses, and fx-cbr and
-// fx-hnb quote against RUB and EUR respectively and are converted below. Which
-// miners are eligible for a given pair is therefore a property of the pair, not
-// a fixed list — see EligibleMiners.
-var parsers = map[string]parserFunc{
-	"fx-frankfurter": parseRatesUpper, // {"rates":{"EUR":0.871}}
-	"fx-vatcomply":   parseRatesUpper, // {"rates":{"EUR":0.860437}}
-	"fx-er-api":      parseRatesUpper, // {"rates":{"EUR":...}}
-	"fx-erapi-v4":    parseRatesUpper, // {"rates":{"EUR":...}} (2dp only)
-	"fx-fawaz":       parseFawaz,      // {"usd":{"eur":0.871}} lowercase
-	"fx-coinbase":    parseCoinbase,   // {"data":{"rates":{"EUR":"0.871"}}} strings
-	"fx-hnb":         parseHNB,        // [{"srednji_tecaj":"1,148100"}] EUR-based, comma decimal
-	"fx-cbr":         parseCBR,        // {"Valute":{"USD":{"Value":...}}} RUB-based
-	"fx-boc":         parseBOC,        // {"observations":[{"FXUSDCAD":{"v":"1.38"}}]} CAD only
-	"fx-riksbank":    parseRiksbank,   // [{"date":...,"value":9.81}] SEK only
-}
-
-// parseRatesUpper handles the common {"base":"USD","rates":{"EUR":0.871}} shape
-// shared by Frankfurter, VATComply and both ExchangeRate-API versions.
-func parseRatesUpper(quote, body string) (float64, error) {
-	var resp struct {
-		Base  string             `json:"base"`
-		Rates map[string]float64 `json:"rates"`
-	}
-	if err := json.Unmarshal([]byte(body), &resp); err != nil {
-		return 0, fmt.Errorf("decoding response: %w", err)
-	}
-	// base_code is er-api's spelling of the same field; an absent base is
-	// treated as USD because every one of these endpoints is called with USD.
-	if resp.Base != "" && resp.Base != "USD" {
-		return 0, fmt.Errorf("expected a USD base, got %q", resp.Base)
-	}
-	rate, ok := resp.Rates[quote]
-	if !ok {
-		return 0, fmt.Errorf("no %s rate in response", quote)
-	}
-	return rate, nil
-}
-
-// parseFawaz handles the currency-api shape, which nests rates under the
-// lowercased base currency and lowercases every quote key.
-func parseFawaz(quote, body string) (float64, error) {
-	var resp map[string]json.RawMessage
-	if err := json.Unmarshal([]byte(body), &resp); err != nil {
-		return 0, fmt.Errorf("decoding response: %w", err)
-	}
-	raw, ok := resp["usd"]
-	if !ok {
-		return 0, fmt.Errorf("no usd block in response")
-	}
-	var rates map[string]float64
-	if err := json.Unmarshal(raw, &rates); err != nil {
-		return 0, fmt.Errorf("decoding usd rates: %w", err)
-	}
-	rate, ok := rates[strings.ToLower(quote)]
-	if !ok {
-		return 0, fmt.Errorf("no %s rate in response", quote)
-	}
-	return rate, nil
-}
-
-// parseCoinbase handles Coinbase's exchange-rates shape. Its rates are JSON
-// *strings* at sixteen decimal places, not numbers, so they are parsed rather
-// than decoded straight into a float.
-func parseCoinbase(quote, body string) (float64, error) {
-	var resp struct {
-		Data struct {
-			Currency string            `json:"currency"`
-			Rates    map[string]string `json:"rates"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal([]byte(body), &resp); err != nil {
-		return 0, fmt.Errorf("decoding response: %w", err)
-	}
-	if resp.Data.Currency != "" && resp.Data.Currency != "USD" {
-		return 0, fmt.Errorf("expected a USD base, got %q", resp.Data.Currency)
-	}
-	s, ok := resp.Data.Rates[quote]
-	if !ok {
-		return 0, fmt.Errorf("no %s rate in response", quote)
-	}
-	rate, err := strconv.ParseFloat(s, 64)
-	if err != nil {
-		return 0, fmt.Errorf("parsing %s rate %q: %w", quote, s, err)
-	}
-	return rate, nil
-}
-
-// parseHNB handles the Croatian National Bank feed, which is the most distant
-// from the others in two ways: its rates are EUR-based (srednji_tecaj is how
-// many units of the listed currency make one EUR) and it formats decimals with
-// a comma, per Croatian convention.
-//
-// Only the USD row is meaningful here: it gives EUR->USD, which inverts to the
-// USD->EUR rate the other miners quote directly. Any other quote currency would
-// need a cross-rate through two HNB rows, which this scaffolding does not do.
-func parseHNB(quote, body string) (float64, error) {
-	if quote != "EUR" {
-		return 0, fmt.Errorf("fx-hnb quotes EUR crosses only, cannot serve %s", quote)
-	}
-	var rows []struct {
-		Valuta  string `json:"valuta"`
-		Srednji string `json:"srednji_tecaj"`
-	}
-	if err := json.Unmarshal([]byte(body), &rows); err != nil {
-		return 0, fmt.Errorf("decoding response: %w", err)
-	}
-	for _, r := range rows {
-		if r.Valuta != "USD" {
-			continue
-		}
-		// Croatian decimal comma: "1,148100" is 1.1481, not 1148100.
-		v, err := strconv.ParseFloat(strings.Replace(r.Srednji, ",", ".", 1), 64)
-		if err != nil {
-			return 0, fmt.Errorf("parsing srednji_tecaj %q: %w", r.Srednji, err)
-		}
-		if v <= 0 {
-			return 0, fmt.Errorf("non-positive EUR/USD rate %v", v)
-		}
-		return 1 / v, nil // EUR->USD inverted to USD->EUR
-	}
-	return 0, fmt.Errorf("no USD row in response")
-}
-
-// parseCBR handles the Central Bank of Russia daily feed, which quotes every
-// currency against RUB with an explicit Nominal (some currencies are quoted per
-// 10 or per 100 units). USD->quote is derived as a cross-rate through RUB.
-func parseCBR(quote, body string) (float64, error) {
-	var resp struct {
-		Valute map[string]struct {
-			Nominal float64 `json:"Nominal"`
-			Value   float64 `json:"Value"`
-		} `json:"Valute"`
-	}
-	if err := json.Unmarshal([]byte(body), &resp); err != nil {
-		return 0, fmt.Errorf("decoding response: %w", err)
-	}
-	perUnit := func(code string) (float64, error) {
-		v, ok := resp.Valute[code]
-		if !ok {
-			return 0, fmt.Errorf("no %s entry in response", code)
-		}
-		if v.Nominal <= 0 || v.Value <= 0 {
-			return 0, fmt.Errorf("unusable %s entry (nominal %v, value %v)", code, v.Nominal, v.Value)
-		}
-		return v.Value / v.Nominal, nil // RUB per one unit
-	}
-	usdRUB, err := perUnit("USD")
-	if err != nil {
-		return 0, err
-	}
-	quoteRUB, err := perUnit(quote)
-	if err != nil {
-		return 0, err
-	}
-	return usdRUB / quoteRUB, nil
-}
-
-// parseBOC handles the Bank of Canada Valet series, which serves one observed
-// series per request and carries its values as strings under the series key.
-//
-// The series is fixed at FXUSDCAD, so this miner can only answer USD/CAD.
-func parseBOC(quote, body string) (float64, error) {
-	if quote != "CAD" {
-		return 0, fmt.Errorf("fx-boc serves the FXUSDCAD series only, cannot serve %s", quote)
-	}
-	var resp struct {
-		Observations []map[string]json.RawMessage `json:"observations"`
-	}
-	if err := json.Unmarshal([]byte(body), &resp); err != nil {
-		return 0, fmt.Errorf("decoding response: %w", err)
-	}
-	if len(resp.Observations) == 0 {
-		return 0, fmt.Errorf("no observations in response")
-	}
-	// Valet returns oldest-first; the pinned request asks for one observation,
-	// but take the last defensively so a wider window still reads the latest.
-	last := resp.Observations[len(resp.Observations)-1]
-	raw, ok := last["FXUSDCAD"]
-	if !ok {
-		return 0, fmt.Errorf("no FXUSDCAD observation in response")
-	}
-	var cell struct {
-		V string `json:"v"`
-	}
-	if err := json.Unmarshal(raw, &cell); err != nil {
-		return 0, fmt.Errorf("decoding FXUSDCAD observation: %w", err)
-	}
-	rate, err := strconv.ParseFloat(cell.V, 64)
-	if err != nil {
-		return 0, fmt.Errorf("parsing FXUSDCAD value %q: %w", cell.V, err)
-	}
-	return rate, nil
-}
-
-// parseRiksbank handles the Swedish Riksbank SWEA series, an array of dated
-// observations for one pre-selected series. The series used for FX_NOW is
-// SEKUSDPMI, which is SEK per USD — already USD->SEK, so no inversion.
-func parseRiksbank(quote, body string) (float64, error) {
-	if quote != "SEK" {
-		return 0, fmt.Errorf("fx-riksbank serves the SEKUSDPMI series only, cannot serve %s", quote)
-	}
-	var rows []struct {
-		Date  string  `json:"date"`
-		Value float64 `json:"value"`
-	}
-	if err := json.Unmarshal([]byte(body), &rows); err != nil {
-		return 0, fmt.Errorf("decoding response: %w", err)
-	}
-	if len(rows) == 0 {
-		return 0, fmt.Errorf("no observations in response")
-	}
-	return rows[len(rows)-1].Value, nil // latest in the pinned window
-}
-
-// âââââââââââââââââââââââââââââââ pair eligibility ââââââââââââââââââââââââââââââ
-
-// FXPairs are the currency pairs FX_NOW is scored on each epoch.
+// FXPairs are the currency pairs the compiled-in FX_NOW config is scored on,
+// used only while intent_specs is unloaded (its question_keys win otherwise).
 //
 // They are fixed rather than derived from a live question because every miner
 // in a round must be asked the *same* pair — a ranking built from miners
-// answering different questions is not a ranking. Fixing them also keeps the
-// LLM request-builder out of the deterministic path.
-//
-// EUR, CAD and SEK specifically: these three are the only combination that
-// leaves no registered FX_NOW miner unscoreable. Three of the ten quote a
-// single currency each (fx-hnb EUR, fx-boc CAD, fx-riksbank SEK), so dropping
-// any one of these pairs would structurally exclude that miner from the intent
-// rather than merely rank it low. The other seven quote all three.
+// answering different questions is not a ranking. Per-currency intents
+// (FX_NOW_EUR under the FX_NOW prefix) each carry one key in their own spec.
 var FXPairs = []string{"EUR", "CAD", "SEK"}
-
-// quoteCoverage records which quote currencies each miner can actually serve.
-// A miner that cannot quote the pair is not a bad miner — it is not a
-// participant in that round, and scoring it 0 would be a false verdict about
-// its quality rather than a statement about its coverage.
-var quoteCoverage = map[string]func(quote string) bool{
-	"fx-frankfurter": anyQuote,
-	"fx-vatcomply":   anyQuote,
-	"fx-er-api":      anyQuote,
-	"fx-erapi-v4":    anyQuote,
-	"fx-fawaz":       anyQuote,
-	"fx-coinbase":    anyQuote,
-	"fx-cbr":         anyQuote, // cross-rate through RUB
-	"fx-hnb":         onlyQuote("EUR"),
-	"fx-boc":         onlyQuote("CAD"),
-	"fx-riksbank":    onlyQuote("SEK"),
-}
-
-func anyQuote(string) bool { return true }
-
-func onlyQuote(supported string) func(string) bool {
-	return func(q string) bool { return q == supported }
-}
-
-// coverageByIntent records, per intent, which question keys each miner can
-// actually serve.
-//
-// The two wired intents sit at opposite ends of this. FX_NOW's coverage is
-// genuinely uneven — three of its ten miners serve exactly one currency each —
-// so the map does real work. ROUTE_ETA's is uniform: every scoreable miner
-// accepts arbitrary coordinates, and the route baked into a slug like
-// "route-osrm-sf-la" is only a registered *default*. That was verified rather
-// than assumed: three differently-slugged miners asked the pinned London route
-// all returned the same duration as the reference fetcher.
-var coverageByIntent = map[string]map[string]func(key string) bool{
-	"ASSET_RESERVE_ATTESTATION": reserveCoverage,
-	"FX_NOW":                    quoteCoverage,
-	"ROUTE_ETA":                 routeCoverage,
-	"ONCHAIN_METRIC_VERIFY":     onchainCoverage,
-	"LIQUIDITY_DEPTH_VERIFY":    liquidityCoverage,
-	"MINING_HASHPRICE_VERIFY":   hashpriceCoverage,
-	"GRID_POWER_PRICE":          gridCoverage,
-	"MACRO_ECONOMIC_INDICATOR":  macroCoverage,
-	"LIVE_SHELF_PRICE":          shelfCoverage,
-}
-
-// CanServeKey reports whether a miner can answer one of an intent's questions.
-func CanServeKey(intentID, slug, key string) bool {
-	byslug, ok := coverageByIntent[intentID]
-	if !ok {
-		// An intent with NO coverage table declares no restriction, so every
-		// miner is eligible and a wrong answer is scored rather than skipped.
-		//
-		// This used to return false, which silently excluded every miner of
-		// any intent not listed in the compiled-in map above — and the map
-		// lists only the nine deterministic intents. EMAIL_SECURITY and
-		// VULNERABILITY_TRIAGE are wired, have miners, and were reaching the
-		// hybrid pass to find nothing eligible: an epoch where the intent is
-		// simply absent, which reads exactly like every miner failing.
-		//
-		// Excluding by default is also the wrong direction on its own terms.
-		// Coverage exists to avoid punishing a miner for a question it
-		// structurally cannot answer (three FX_NOW miners serve one currency
-		// each). Absent evidence of such a limit, the safe assumption is that
-		// the miner can answer and should be held to its answer.
-		return true
-	}
-	if f, ok := byslug[slug]; ok {
-		return f(key)
-	}
-
-	// A SUFFIXED VARIANT of a listed miner inherits its coverage.
-	//
-	// The tables were written when each intent had one miner, and the
-	// registration waves then added variants of it: reserveCoverage lists
-	// "res-wbtc-por" while the nine registered miners are
-	// "res-wbtc-por-1rpc", "-drpc", "-flashbots" and so on. Every one was
-	// excluded, so five wired intents fetched ground truth, asked nineteen
-	// miners and ranked nobody — silently, because an intent with no eligible
-	// miners looks exactly like an intent whose miners all failed.
-	//
-	// Matching on "<listed>-" rather than a bare prefix is deliberate: it
-	// admits "res-wbtc-por-drpc" without admitting an unrelated miner that
-	// merely starts with the same letters.
-	for known, f := range byslug {
-		if strings.HasPrefix(slug, known+"-") {
-			return f(key)
-		}
-	}
-
-	// Within an intent that HAS a coverage table the table is otherwise
-	// exhaustive, so an unrelated slug is excluded rather than assumed
-	// capable. These omissions are deliberate and tested: deregistered
-	// miners, and ones known not to answer the question at all (ROUTE_ETA's
-	// Photon miners geocode place names and return no duration).
-	return false
-}
-
-// CanServe reports whether an FX_NOW miner can quote USD against a currency.
-//
-// Retained as FX_NOW's named entry point; CanServeKey is the general form.
-func CanServe(slug, quote string) bool {
-	return CanServeKey("FX_NOW", slug, strings.ToUpper(quote))
-}
-
-// EligibleForKey filters miner slugs to those that can answer this question.
-//
-// Callers should rank only these. Including a miner that structurally cannot
-// answer would score it 0 and push it to the bottom of the leaderboard for a
-// reason that has nothing to do with the quality of the data it does serve.
-func EligibleForKey(intentID string, slugs []string, key string) []string {
-	eligible := make([]string, 0, len(slugs))
-	for _, s := range slugs {
-		if CanServeKey(intentID, s, key) {
-			eligible = append(eligible, s)
-		}
-	}
-	return eligible
-}
-
-// EligibleMiners filters FX_NOW miners to those that can quote the pair.
-func EligibleMiners(slugs []string, quote string) []string {
-	return EligibleForKey("FX_NOW", slugs, strings.ToUpper(quote))
-}

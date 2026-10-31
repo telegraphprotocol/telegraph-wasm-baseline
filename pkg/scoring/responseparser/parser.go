@@ -43,7 +43,6 @@ const (
 	EnvModel        = "PARSER_LLM_MODEL"
 	EnvKey          = "PARSER_LLM_KEY"
 	EnvTimeout      = "PARSER_LLM_TIMEOUT_SECONDS"
-	EnvShadow       = "PARSER_LLM_SHADOW"
 	EnvMaxBodyChars = "PARSER_LLM_MAX_BODY_CHARS"
 
 	// User-request path (POST /engine/v1/ask, WS ask). Only meaningful when
@@ -63,6 +62,9 @@ const (
 	DefaultTimeout      = 60 * time.Second
 	DefaultMaxBodyChars = 60000 // ~15-20k tokens; the server allows 32768
 	MaxTokens           = 96    // same as the experiments script (--max-new-tokens 96)
+	// ProcessMaxTokens bounds a processed field's reply, which also lists the
+	// values the model used ("from").
+	ProcessMaxTokens = 1024
 	// DefaultUserTimeout bounds shaping one user answer (every field's model
 	// call): the user is waiting on it, and a slow parser must not hold an
 	// answer that is already in hand. Fields not read in time are
@@ -79,7 +81,6 @@ type Config struct {
 	Model        string
 	Key          string
 	Timeout      time.Duration
-	Shadow       bool
 	MaxBodyChars int
 
 	// UserDisabled turns off only the user-request path (ParseAll with User); the
@@ -120,12 +121,6 @@ func ConfigFromEnv() (cfg Config, enabled bool, err error) {
 			return Config{}, false, fmt.Errorf("%s=%q is not a positive number", EnvMaxBodyChars, v)
 		}
 		cfg.MaxBodyChars = n
-	}
-	if v := strings.TrimSpace(os.Getenv(EnvShadow)); v != "" {
-		cfg.Shadow, err = strconv.ParseBool(v)
-		if err != nil {
-			return Config{}, false, fmt.Errorf("%s=%q is not a boolean", EnvShadow, v)
-		}
 	}
 	cfg.UserTimeout = DefaultUserTimeout
 	if v := strings.TrimSpace(os.Getenv(EnvUserTimeout)); v != "" {
@@ -176,9 +171,13 @@ func New(cfg Config) *Parser {
 		cache: newReplyCache(cacheMaxEntries, cacheTTL)}
 }
 
-// Shadow reports whether the parser should only be logged next to the older
-// parse paths rather than decide the scored value.
-func (p *Parser) Shadow() bool { return p != nil && p.cfg.Shadow }
+// MaxBodyChars is the longest answer the parser reads (PARSER_LLM_MAX_BODY_CHARS).
+func (p *Parser) MaxBodyChars() int {
+	if p == nil || p.cfg.MaxBodyChars <= 0 {
+		return DefaultMaxBodyChars
+	}
+	return p.cfg.MaxBodyChars
+}
 
 // UserEnabled reports whether the user-request path (the routed ask reply) is on.
 func (p *Parser) UserEnabled() bool { return p != nil && !p.cfg.UserDisabled }
@@ -290,6 +289,11 @@ func (p *Parser) Parse(ctx context.Context, req Request) (Result, error) {
 // under k or from a call. k must identify the prompt: every input that changes
 // UserMessage(fl, body) must be part of it.
 func (p *Parser) reply(ctx context.Context, k string, fl Field, body string) (string, bool, error) {
+	return p.ask(ctx, k, body, SystemPrompt, UserMessage(fl, body), MaxTokens)
+}
+
+// ask is reply for any prompt over body: k must identify system and user.
+func (p *Parser) ask(ctx context.Context, k, body, system, user string, maxTokens int) (string, bool, error) {
 	if e, ok := p.cache.get(k, time.Now()); ok {
 		return e.reply, true, e.err
 	}
@@ -299,8 +303,8 @@ func (p *Parser) reply(ctx context.Context, k string, fl Field, body string) (st
 		p.cache.put(k, cacheEntry{err: err}, time.Now())
 		return "", false, err
 	}
-	content, err := p.llm.Complete(ctx, SystemPrompt, UserMessage(fl, body),
-		&llm.Options{MaxTokens: MaxTokens, Temperature: 0})
+	content, err := p.llm.Complete(ctx, system, user,
+		&llm.Options{MaxTokens: maxTokens, Temperature: 0})
 	if err != nil {
 		err = fmt.Errorf("%w: %v", ErrUnavailable, err)
 		// A context cancelled by the caller says nothing about the model:

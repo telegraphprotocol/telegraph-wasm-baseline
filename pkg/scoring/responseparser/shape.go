@@ -298,6 +298,10 @@ func (p *Parser) parseField(ctx context.Context, req ShapeRequest, fl Field, dec
 		k = cacheKey(req.IntentID, req.Key, view.Name+"|unit="+view.Unit, req.Body)
 	}
 
+	if fl.Processed {
+		return p.processField(ctx, req, view, conv, declaredUnit)
+	}
+
 	reply, cached, err := p.reply(ctx, k, view, req.Body)
 	fv.Cached = cached
 	if err != nil {
@@ -319,9 +323,110 @@ func (p *Parser) parseField(ctx context.Context, req ShapeRequest, fl Field, dec
 	return fv
 }
 
+// processField reads a processed field (Field.Processed): the model works the
+// value out of the answer for the request and cites the values it used. Code
+// checks each cited value is in the answer (cited), then converts and
+// range-checks the value like any other. It checks the evidence exists, not
+// the model's arithmetic.
+func (p *Parser) processField(ctx context.Context, req ShapeRequest, view, conv Field, unit string) FieldValue {
+	fv := FieldValue{Name: conv.Name, Type: conv.Type, Unit: conv.Unit}
+	fail := func(err error) FieldValue {
+		fv.Status, fv.Reason, fv.Value = FieldStatusOf(err), err.Error(), nil
+		return fv
+	}
+	request := req.Query
+	if strings.TrimSpace(request) == "" {
+		request = req.Key
+	}
+	// The request is part of the prompt, so it is part of the key: the same
+	// answer read for another request is another reply.
+	k := cacheKey(req.IntentID, "\x02processed\x00"+request,
+		view.Name+"|unit="+view.Unit+"|desc="+view.Description, req.Body)
+	reply, cached, err := p.ask(ctx, k, req.Body, ProcessSystemPrompt,
+		ProcessUserMessage(view, req.Body, request), ProcessMaxTokens)
+	fv.Cached = cached
+	if err != nil {
+		return fail(err)
+	}
+	c, from, ok := ParseProcessedReply(reply)
+	if !ok {
+		return fail(ErrBadReply)
+	}
+	if c.Kind == CopiedNone {
+		return fail(ErrNotFound)
+	}
+	fv.Copied = copiedText(c)
+	if c.Kind != CopiedText {
+		return fail(fmt.Errorf("%w: %s field got a %s", ErrWrongShape, conv.Type, kindName(c.Kind)))
+	}
+	if len(from) == 0 && conv.Type != TypeString && conv.Type != TypeEnum {
+		// "true" or "0" alone matches almost any JSON answer: a worked-out
+		// number or yes/no must name what it rests on.
+		return fail(fmt.Errorf("%w: a worked-out %s cites no values", ErrNotVerbatim, conv.Type))
+	}
+	if err := cited(c.Text, from, req.Body, request); err != nil {
+		return fail(err)
+	}
+	v, err := ConvertProcessed(conv, c.Text, unit)
+	if err != nil {
+		return fail(err)
+	}
+	fv.Status, fv.Value = FieldOK, v
+	return fv
+}
+
+// cited checks a processed value's evidence: every value it cites must be in
+// the answer or the request (a threshold the request sets), and at least one
+// of them (or the value itself, when it cites none) must be in the answer but
+// not in the request. The request alone is never evidence, the caller writes
+// it, and an answer that only echoes it (an error body repeating the
+// question) backs nothing (reviews F, #230).
+func cited(value string, from []string, body, request string) error {
+	ownWords := func(s string) bool { return Verbatim(s, body) && !Verbatim(s, request) }
+	if len(from) == 0 {
+		if ownWords(value) {
+			return nil
+		}
+		return fmt.Errorf("%w: %q is not in the answer's own words and cites no values", ErrNotVerbatim, value)
+	}
+	backed := false
+	for _, f := range from {
+		if !Verbatim(f, body) && !Verbatim(f, request) {
+			return fmt.Errorf("%w: cited value %q is not in the answer", ErrNotVerbatim, f)
+		}
+		backed = backed || ownWords(f)
+	}
+	if !backed {
+		return fmt.Errorf("%w: every cited value only repeats the request", ErrNotVerbatim)
+	}
+	return nil
+}
+
+// ConvertProcessed turns a processed value into the field's typed value: the
+// conversions ConvertValue makes for one value (an enum's allowed values),
+// without its verbatim check (cited guards a worked-out value).
+func ConvertProcessed(fl Field, text, unit string) (any, error) {
+	if !processable(fl.Type) {
+		return nil, fmt.Errorf("%w: a %s field cannot be processed", ErrWrongShape, fl.Type)
+	}
+	if fl.Type == TypeBool {
+		// The model replies true or false (ProcessSystemPrompt); true_when is
+		// for copied text, and anything else is not an answer.
+		switch strings.ToLower(strings.TrimSpace(text)) {
+		case "true":
+			return true, nil
+		case "false":
+			return false, nil
+		}
+		return nil, fmt.Errorf("%w: %q is not true or false", ErrConvert, text)
+	}
+	return convertOne(fl, text, unit)
+}
+
 // ConvertValue turns what the model copied into the field's typed value. It is
 // where the verbatim guard runs for every field type, and where all
-// conversion lives (the model never converts):
+// conversion lives (the model never converts; a processed value is its own
+// working, converted by ConvertProcessed):
 //
 //	number   : Convert (unit alias or inverse, then range) -> float64
 //	integer  : a whole number, range-checked -> int64
@@ -383,6 +488,11 @@ func ConvertValue(fl Field, c Copied, body, unit string) (any, error) {
 	if !Verbatim(text, body) {
 		return nil, fmt.Errorf("%w: %q", ErrNotVerbatim, text)
 	}
+	return convertOne(fl, text, unit)
+}
+
+// convertOne converts one value by the field's type.
+func convertOne(fl Field, text, unit string) (any, error) {
 	switch fl.Type {
 	case TypeNumber:
 		return Convert(fl, text, unit)

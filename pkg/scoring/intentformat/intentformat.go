@@ -168,10 +168,30 @@ func CheckClass(intentID string, f *responseparser.Format, classOf ClassFunc) er
 
 // Same reports whether two formats are the same once decoded (key order and
 // whitespace in the stored JSON do not matter).
+//
+// Decimals, off_chain and inputs are not compared: they say how a request
+// arrives and how an answer reaches a contract in a job
+// (responseparser.DecodeOnChainInputs, EncodeOnChain), not how an answer is
+// read or scored.
 func Same(a, b *responseparser.Format) bool {
-	ja, errA := json.Marshal(a)
-	jb, errB := json.Marshal(b)
+	ja, errA := json.Marshal(readView(a))
+	jb, errB := json.Marshal(readView(b))
 	return errA == nil && errB == nil && bytes.Equal(ja, jb)
+}
+
+// readView is f without what Same does not compare.
+func readView(f *responseparser.Format) *responseparser.Format {
+	if f == nil {
+		return nil
+	}
+	c := *f
+	c.Inputs = nil
+	c.Fields = make([]responseparser.Field, len(f.Fields))
+	for i, fl := range f.Fields {
+		fl.Decimals, fl.OffChain = nil, false
+		c.Fields[i] = fl
+	}
+	return &c
 }
 
 // Own returns an intent's own format, without family inheritance.

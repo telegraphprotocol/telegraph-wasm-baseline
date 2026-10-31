@@ -1,9 +1,9 @@
 /target
 # Rust build output
-/wide_runtime/wide_wasm/target/
-/wide_runtime/vm_float_wasm/target/
+/float_runtime/engine/target/
+/float_runtime/engine/build.log
 /legacy/v1-minilm/target/
-# training / conversion / packaging output (each .imwq and package is ~1.2 GB)
+# training / export / packaging output (the foundation export is ~600 MB)
 /runs/
 # Python
 __pycache__/

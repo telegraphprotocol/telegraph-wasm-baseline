@@ -1,11 +1,12 @@
 // Package wasmbin is a minimal, dependency-free reader/writer for the WebAssembly binary
-// format — just enough to (a) classify a module by its exports WITHOUT compiling it, and
-// (b) let pkg/wasm/wideembed rewrite the memory and data sections of an embed host.
+// format — just enough to classify a module by its imports, exports and custom sections
+// WITHOUT compiling it, and to build small modules in tests.
 //
-// Classification has to be cheap because a self-contained wide package is ~1.2 GB: handing
-// that to wazero just to ask "which ABI is this?" would decode, copy and compile the whole
-// thing. The export section precedes the code and data sections, so ExportNames reads only
-// section headers until it reaches it — O(header), regardless of how big the model is.
+// Classification has to be cheap because a registration can be a ~600 MB legacy full-model
+// module that must be refused from its first MiB: handing that to wazero just to ask "which
+// ABI is this?" would decode, copy and compile the whole thing. The import and export sections precede the code and data
+// sections, so Imports and ExportNames read only section headers until they reach them —
+// O(header), regardless of how big the model is.
 //
 // Every read is bounds-checked and returns an error rather than panicking: the input is
 // untrusted bytes fetched from an author's URL.
@@ -243,6 +244,143 @@ func ExportNames(b []byte) (map[string]byte, error) {
 		off = s.End
 	}
 	return map[string]byte{}, nil
+}
+
+// Import kinds (§5.5.9) — the same byte values as the export kinds.
+const (
+	ImportFunc   byte = 0
+	ImportTable  byte = 1
+	ImportMemory byte = 2
+	ImportGlobal byte = 3
+)
+
+// Import is one entry of the import section.
+type Import struct {
+	Module string
+	Name   string
+	Kind   byte
+}
+
+// Imports returns every import, in order, reading section headers only up to
+// (and including) the import section. Like ExportNames it never touches the
+// code or data sections, so it is cheap on a module whose data segment is
+// hundreds of MB, and it works on a file truncated after its imports. A module
+// with no import section yields an empty slice.
+func Imports(b []byte) ([]Import, error) {
+	if !IsWasm(b) {
+		return nil, ErrNotWasm
+	}
+	off := len(Magic)
+	for off < len(b) {
+		s, err := nextSection(b, off)
+		if err != nil {
+			return nil, err
+		}
+		if s.End > len(b) {
+			return nil, fmt.Errorf("wasmbin: section %d runs past the end of the module before the import section", s.ID)
+		}
+		switch {
+		case s.ID == SecImport:
+			return parseImports(s.Payload(b))
+		case s.ID == SecCustom || s.ID == SecType:
+			// keep walking: custom sections may appear anywhere; type precedes imports
+		default:
+			// Past the import section's slot: the module imports nothing.
+			return []Import{}, nil
+		}
+		off = s.End
+	}
+	return []Import{}, nil
+}
+
+func parseImports(p []byte) ([]Import, error) {
+	n, k, err := ReadU32(p, 0)
+	if err != nil {
+		return nil, err
+	}
+	off := k
+	readName := func(what string) (string, error) {
+		nl, k, err := ReadU32(p, off)
+		if err != nil {
+			return "", err
+		}
+		off += k
+		if off+int(nl) > len(p) {
+			return "", fmt.Errorf("wasmbin: import %s runs past the import section", what)
+		}
+		s := string(p[off : off+int(nl)])
+		off += int(nl)
+		return s, nil
+	}
+	skipLimits := func() error {
+		if off >= len(p) {
+			return fmt.Errorf("wasmbin: import limits truncated")
+		}
+		flag := p[off]
+		off++
+		if _, k, err := ReadU32(p, off); err != nil { // min
+			return err
+		} else {
+			off += k
+		}
+		if flag&0x01 != 0 { // has max
+			_, k, err := ReadU32(p, off)
+			if err != nil {
+				return err
+			}
+			off += k
+		}
+		return nil
+	}
+	// n is untrusted: an entry is at least 4 bytes (two empty names, kind, index).
+	out := make([]Import, 0, capHint(n, len(p)-off, 4))
+	for i := uint32(0); i < n; i++ {
+		mod, err := readName("module name")
+		if err != nil {
+			return nil, err
+		}
+		name, err := readName("field name")
+		if err != nil {
+			return nil, err
+		}
+		if off >= len(p) {
+			return nil, fmt.Errorf("wasmbin: import %s.%s has no kind byte", mod, name)
+		}
+		kind := p[off]
+		off++
+		switch kind {
+		case ImportFunc:
+			_, k, err := ReadU32(p, off) // type index
+			if err != nil {
+				return nil, err
+			}
+			off += k
+		case ImportTable:
+			if off >= len(p) {
+				return nil, fmt.Errorf("wasmbin: import %s.%s table type truncated", mod, name)
+			}
+			off++ // reftype
+			if err := skipLimits(); err != nil {
+				return nil, err
+			}
+		case ImportMemory:
+			if err := skipLimits(); err != nil {
+				return nil, err
+			}
+		case ImportGlobal:
+			if off+2 > len(p) {
+				return nil, fmt.Errorf("wasmbin: import %s.%s global type truncated", mod, name)
+			}
+			off += 2 // valtype, mutability
+		default:
+			return nil, fmt.Errorf("wasmbin: import %s.%s has unknown kind 0x%02x", mod, name, kind)
+		}
+		out = append(out, Import{Module: mod, Name: name, Kind: kind})
+	}
+	if off != len(p) {
+		return nil, fmt.Errorf("wasmbin: %d trailing bytes in import section", len(p)-off)
+	}
+	return out, nil
 }
 
 // capHint bounds a preallocation for n untrusted entries by the most that

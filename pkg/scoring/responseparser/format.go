@@ -24,6 +24,7 @@ package responseparser
 import (
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"sort"
 	"strings"
 )
@@ -83,6 +84,49 @@ type Format struct {
 	// experiments used. Keyed by question key; merged over the key's
 	// truth_params.key_params, Vars winning.
 	Vars map[string]map[string]string `json:"vars,omitempty"`
+	// Inputs are the values a request to the intent carries, in order: a
+	// job's params hold them by the same layout rule as an answer
+	// (DecodeOnChainInputs), and the request builder turns them into the
+	// miner's API request. Optional: without them a job keeps its miner's
+	// YAML on_chain.request mapping.
+	Inputs []Input `json:"inputs,omitempty"`
+}
+
+// Input is one value a request to the intent carries (Ahmed, 2026-10-22: the
+// intent's input schema). Types: number, integer, bool, string, enum, date,
+// datetime.
+//
+// It is the ONE request schema of the intent, on-chain and off-chain alike:
+// a job's params hold the inputs in this order by their type
+// (DecodeOnChainInputs), and a consumer's {intent, params} or free-form query
+// is validated against the same list (pkg/scoring/intentinput derives its
+// schema from it, never from a second table).
+type Input struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	Type        string `json:"type"`
+	Unit        string `json:"unit,omitempty"`
+	// Decimals: a number input arrives on-chain as value × 10^Decimals, an
+	// int256. Required on number inputs.
+	Decimals *int      `json:"decimals,omitempty"`
+	Range    []float64 `json:"range,omitempty"`
+	Allowed  []string  `json:"allowed,omitempty"`
+
+	// Off-chain request rules (additive; the on-chain layout ignores them, a
+	// job's params always carry every slot):
+	//
+	// Optional: a consumer request may leave the input out. Absent, every
+	// input is required, which is what the on-chain layout already means.
+	Optional bool `json:"optional,omitempty"`
+	// Default is applied to an absent optional input (optional only; must be
+	// a valid value of the input's type).
+	Default any `json:"default,omitempty"`
+	// Pattern is a Go regular expression the WHOLE string must match (string
+	// inputs only).
+	Pattern string `json:"pattern,omitempty"`
+	// Examples are for people (docs, the schema API); never shown to the
+	// parser model, which must not copy a value the query does not contain.
+	Examples []any `json:"examples,omitempty"`
 }
 
 // ParamsFor merges the key's truth_params.key_params with the format's own
@@ -141,6 +185,32 @@ type Field struct {
 	// intent_specs.response_format with no field marked keeps its old rule:
 	// the first field is the scored one (ParseFormat sets the flag on it).
 	Scored bool `json:"scored,omitempty"`
+
+	// Decimals is how a number field reaches a contract in a job's answer
+	// (EncodeOnChain): round(value × 10^Decimals), an int256. Number fields
+	// only, 0 to MaxDecimals. A format whose number fields all set it can be
+	// delivered on-chain; without it the job keeps its miner's YAML mapping.
+	Decimals *int `json:"decimals,omitempty"`
+
+	// Processed marks a value worked out of the answer for the request rather
+	// than copied from it (Ahmed, 2026-10-22: an intent's answer is processed
+	// intelligence): a verdict in the intent's own words from a miner that
+	// writes its own (isAI: true → "Synthetic"), a one-sentence brief. The same
+	// parser model reads it with ProcessSystemPrompt and cites the values it
+	// used; code checks each is in the answer, and an enum's value is one of
+	// its allowed values. A worked-out number or bool (a total over a window,
+	// a threshold crossed) is the model's own arithmetic: only its cited
+	// values are checked, not the sum (Umar, 2026-10-23: Gemini for now; code
+	// that recomputes it is the next step). Lists, objects, dates and datetimes are
+	// not processed.
+	Processed bool `json:"processed,omitempty"`
+
+	// OffChain keeps the field in the API answer only: a job's on-chain answer
+	// (EncodeOnChain) leaves it out. For what a contract cannot take or use
+	// (lists, objects, long free text, Ahmed 2026-10-22: contracts get the
+	// processed intelligence, not generic responses); the on-chain answer is
+	// the other fields, in order.
+	OffChain bool `json:"off_chain,omitempty"`
 }
 
 // QueryPlaceholder is the one placeholder a user_description may use: the
@@ -308,6 +378,20 @@ func (f *Format) Validate() error {
 				return fmt.Errorf("response_format field %q is %q; unit_aliases are only allowed on number fields", fl.Name, fl.Type)
 			}
 		}
+		if fl.Decimals != nil {
+			if fl.Type != TypeNumber {
+				return fmt.Errorf("response_format field %q is %q; decimals is only allowed on number fields", fl.Name, fl.Type)
+			}
+			if *fl.Decimals < 0 || *fl.Decimals > MaxDecimals {
+				return fmt.Errorf("response_format field %q decimals must be 0 to %d, got %d", fl.Name, MaxDecimals, *fl.Decimals)
+			}
+		}
+		if fl.Processed && !processable(fl.Type) {
+			return fmt.Errorf("response_format field %q is %q; only string, enum, number, integer and bool fields can be processed", fl.Name, fl.Type)
+		}
+		if fl.Processed && fl.Scored {
+			return fmt.Errorf("response_format field %q is both scored and processed; scoring copies the value", fl.Name)
+		}
 		if fl.Scored {
 			scored++
 			if fl.Type != TypeNumber && fl.Type != TypeBool {
@@ -330,8 +414,67 @@ func (f *Format) Validate() error {
 	if scored > 1 {
 		return fmt.Errorf("response_format marks %d fields scored; at most one can be", scored)
 	}
+	return f.validateInputs()
+}
+
+func (f *Format) validateInputs() error {
+	if len(f.Inputs) > MaxFields {
+		return fmt.Errorf("response_format declares %d inputs; at most %d", len(f.Inputs), MaxFields)
+	}
+	seen := make(map[string]bool, len(f.Inputs))
+	for i, in := range f.Inputs {
+		if strings.TrimSpace(in.Name) == "" {
+			return fmt.Errorf("response_format input %d has no name", i)
+		}
+		if seen[in.Name] {
+			return fmt.Errorf("response_format input name %q is used twice", in.Name)
+		}
+		seen[in.Name] = true
+		if strings.TrimSpace(in.Description) == "" {
+			return fmt.Errorf("response_format input %q has no description; the request builder would not know what it is", in.Name)
+		}
+		switch in.Type {
+		case TypeNumber:
+			if in.Decimals == nil || *in.Decimals < 0 || *in.Decimals > MaxDecimals {
+				return fmt.Errorf("response_format number input %q needs decimals 0 to %d", in.Name, MaxDecimals)
+			}
+		case TypeInteger, TypeBool, TypeString, TypeDate, TypeDatetime:
+		case TypeEnum:
+			if len(in.Allowed) == 0 {
+				return fmt.Errorf("response_format enum input %q has no allowed values", in.Name)
+			}
+		default:
+			return fmt.Errorf("response_format input %q has type %q; inputs are number, integer, bool, string, enum, date or datetime", in.Name, in.Type)
+		}
+		if in.Decimals != nil && in.Type != TypeNumber {
+			return fmt.Errorf("response_format input %q is %q; decimals is only allowed on number inputs", in.Name, in.Type)
+		}
+		if len(in.Range) != 0 && ((in.Type != TypeNumber && in.Type != TypeInteger) || len(in.Range) != 2 || in.Range[0] > in.Range[1]) {
+			return fmt.Errorf("response_format input %q range must be [min, max] on a number or integer input", in.Name)
+		}
+		if len(in.Allowed) > 0 && in.Type != TypeEnum {
+			return fmt.Errorf("response_format input %q is %q; allowed is only allowed on enum inputs", in.Name, in.Type)
+		}
+		if in.Pattern != "" {
+			if in.Type != TypeString {
+				return fmt.Errorf("response_format input %q is %q; pattern is only allowed on string inputs", in.Name, in.Type)
+			}
+			if _, err := regexp.Compile(`^(?:` + in.Pattern + `)$`); err != nil {
+				return fmt.Errorf("response_format input %q pattern does not compile: %w", in.Name, err)
+			}
+		}
+		if in.Default != nil && !in.Optional {
+			return fmt.Errorf("response_format input %q has a default but is not optional", in.Name)
+		}
+		if len(in.Examples) > MaxInputExamples {
+			return fmt.Errorf("response_format input %q has %d examples; at most %d", in.Name, len(in.Examples), MaxInputExamples)
+		}
+	}
 	return nil
 }
+
+// MaxInputExamples bounds Input.Examples.
+const MaxInputExamples = 10
 
 // ScoredIndex is the index of the scored field, or -1 when no field is
 // scored (a judgment intent's format).
@@ -472,4 +615,14 @@ func (fl Field) ForUser(query, declaredUnit string) Field {
 	// One pass: a query that itself contains "{query}" is not expanded again.
 	out.Description = strings.ReplaceAll(tmpl, QueryPlaceholder, query)
 	return out
+}
+
+// processable reports whether a field of type t can be worked out
+// (Field.Processed) rather than copied.
+func processable(t string) bool {
+	switch t {
+	case TypeString, TypeEnum, TypeNumber, TypeInteger, TypeBool:
+		return true
+	}
+	return false
 }

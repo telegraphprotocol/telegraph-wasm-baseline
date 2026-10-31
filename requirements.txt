@@ -1,11 +1,11 @@
-# Training and conversion (wide_runtime). Install a CUDA build of torch for GPU training:
-# https://pytorch.org/get-started/locally/
+# Training and export (float_runtime). Install a CUDA build of torch for GPU training:
+# https://pytorch.org/get-started/locally/  (export runs fine on CPU)
 torch
 transformers>=4.48   # ModernBERT support
 peft
 numpy
-onnx>=1.17
-huggingface_hub>=0.27
+onnx                 # export_foundation: writes and checks the foundation graph
+onnxruntime          # export_foundation --check-adapter: runs the graph against PyTorch
 # only for --hf-dataset
 datasets
 # only for --config <file>.yaml

@@ -13,7 +13,14 @@ import (
 )
 
 // LoadSpecs reads every active intent spec from the database and returns the
-// configs and truth sources the scorer needs.
+// configs the scorer needs (question template and keys, tolerance, scale,
+// response format, fusion).
+//
+// It does NOT build truth sources: deterministic ground truth comes from
+// eval-pool truth-source material (scoring.MaterialTruthSource). The
+// truth_source column is no longer read by scoring and a row is not refused
+// for an unknown or empty one; truth_params is read only for its key_params,
+// which fill {<param>} placeholders in the response format.
 //
 // This replaces the hand-maintained intentConfigs map. The map was fine for two
 // intents and became the bottleneck at nine: every new intent, every retuned
@@ -22,10 +29,10 @@ import (
 // validators on different builds would score the same miner differently and
 // disagree on the epoch, silently.
 //
-// Rows are DATA, not code: a spec naming an unknown truth source or an
-// unparseable key set is rejected loudly here rather than producing an intent
+// Rows are DATA, not code: an unparseable key set, scale, fusion block or
+// response format is rejected loudly here rather than producing an intent
 // that loads and then scores every miner identically.
-func LoadSpecs(ctx context.Context, db *sql.DB) (map[string]IntentConfig, map[string]TruthSource, error) {
+func LoadSpecs(ctx context.Context, db *sql.DB) (map[string]IntentConfig, error) {
 	rows, err := db.QueryContext(ctx, `
 		SELECT intent_id, comparator_code, tolerance_bps, scale,
 		       truth_source, truth_params, question_keys, question_template, label,
@@ -47,12 +54,11 @@ func LoadSpecs(ctx context.Context, db *sql.DB) (map[string]IntentConfig, map[st
 			ORDER BY intent_id`)
 	}
 	if err != nil {
-		return nil, nil, fmt.Errorf("comparator: reading intent_specs: %w", err)
+		return nil, fmt.Errorf("comparator: reading intent_specs: %w", err)
 	}
 	defer rows.Close()
 
 	configs := make(map[string]IntentConfig)
-	truths := make(map[string]TruthSource)
 
 	for rows.Next() {
 		var (
@@ -65,10 +71,11 @@ func LoadSpecs(ctx context.Context, db *sql.DB) (map[string]IntentConfig, map[st
 		)
 		if err := rows.Scan(&intentID, &code, &tolerance, &scale,
 			&truthSource, &paramsJSON, &keysJSON, &questionTmpl, &label, &fusionJSON, &formatJSON); err != nil {
-			return nil, nil, fmt.Errorf("comparator: scanning intent_specs: %w", err)
+			return nil, fmt.Errorf("comparator: scanning intent_specs: %w", err)
 		}
+		_ = truthSource // no longer read by scoring: truth comes from eval-pool material
 
-		cfg, src, err := parseSpecRow(intentID, code, tolerance, scale, truthSource, paramsJSON, keysJSON, questionTmpl, label, fusionJSON, formatJSON)
+		cfg, err := parseSpecRow(intentID, code, tolerance, scale, paramsJSON, keysJSON, questionTmpl, label, fusionJSON, formatJSON)
 		if err != nil {
 			// One malformed row must not take every other intent down with it:
 			// skip it, loudly, and keep loading. The skipped intent is simply not
@@ -78,42 +85,38 @@ func LoadSpecs(ctx context.Context, db *sql.DB) (map[string]IntentConfig, map[st
 			continue
 		}
 		configs[intentID] = cfg
-		truths[intentID] = src
 	}
 	if err := rows.Err(); err != nil {
-		return nil, nil, fmt.Errorf("comparator: iterating intent_specs: %w", err)
+		return nil, fmt.Errorf("comparator: iterating intent_specs: %w", err)
 	}
-	return configs, truths, nil
+	return configs, nil
 }
 
-// parseSpecRow validates one intent_specs row and builds its config and truth
-// source. An error means the row is unusable as written.
-func parseSpecRow(intentID string, code, tolerance int64, scale float64, truthSource string,
-	paramsJSON, keysJSON []byte, questionTmpl, label string, fusionJSON, formatJSON []byte) (IntentConfig, TruthSource, error) {
+// parseSpecRow validates one intent_specs row and builds its config. An error
+// means the row is unusable as written. The row's truth_source is not an
+// input: it is no longer used by scoring, so an unknown or empty one is not a
+// reason to refuse the row.
+func parseSpecRow(intentID string, code, tolerance int64, scale float64,
+	paramsJSON, keysJSON []byte, questionTmpl, label string, fusionJSON, formatJSON []byte) (IntentConfig, error) {
 	var keys []string
 	if err := json.Unmarshal(keysJSON, &keys); err != nil {
-		return IntentConfig{}, nil, fmt.Errorf("comparator: %s question_keys is not a JSON array: %w", intentID, err)
+		return IntentConfig{}, fmt.Errorf("comparator: %s question_keys is not a JSON array: %w", intentID, err)
 	}
 	if len(keys) == 0 {
 		// An intent with no questions cannot be scored. Silently keeping it
 		// would produce an epoch where it is simply absent, which looks the
 		// same as every miner failing.
-		return IntentConfig{}, nil, fmt.Errorf("comparator: %s has no question keys", intentID)
+		return IntentConfig{}, fmt.Errorf("comparator: %s has no question keys", intentID)
 	}
 	if scale == 0 {
-		return IntentConfig{}, nil, fmt.Errorf("comparator: %s has scale 0; every miner value would collapse to zero", intentID)
+		return IntentConfig{}, fmt.Errorf("comparator: %s has scale 0; every miner value would collapse to zero", intentID)
 	}
 
 	var params map[string]any
 	if len(paramsJSON) > 0 {
 		if err := json.Unmarshal(paramsJSON, &params); err != nil {
-			return IntentConfig{}, nil, fmt.Errorf("comparator: %s truth_params is not a JSON object: %w", intentID, err)
+			return IntentConfig{}, fmt.Errorf("comparator: %s truth_params is not a JSON object: %w", intentID, err)
 		}
-	}
-
-	src, err := NewTruthSource(truthSource, params)
-	if err != nil {
-		return IntentConfig{}, nil, fmt.Errorf("comparator: %s: %w", intentID, err)
 	}
 
 	// A fusion block marks the intent HYBRID: its score comes from a
@@ -121,7 +124,7 @@ func parseSpecRow(intentID string, code, tolerance int64, scale float64, truthSo
 	// judgment about the response text. Absent means deterministic.
 	fusion, err := parseFusion(intentID, fusionJSON)
 	if err != nil {
-		return IntentConfig{}, nil, err
+		return IntentConfig{}, err
 	}
 
 	// The response format is the intent's own description of the value
@@ -130,7 +133,7 @@ func parseSpecRow(intentID string, code, tolerance int64, scale float64, truthSo
 	// otherwise load and then fail every miner at scoring time.
 	format, err := responseparser.ParseFormat(formatJSON)
 	if err != nil {
-		return IntentConfig{}, nil, fmt.Errorf("comparator: %s: %w", intentID, err)
+		return IntentConfig{}, fmt.Errorf("comparator: %s: %w", intentID, err)
 	}
 
 	tmpl := questionTmpl
@@ -144,7 +147,7 @@ func parseSpecRow(intentID string, code, tolerance int64, scale float64, truthSo
 		Keys:           keys,
 		Question:       func(key string) string { return strings.ReplaceAll(tmpl, "{key}", key) },
 		Describe:       func(key string) string { return key },
-	}, src, nil
+	}, nil
 }
 
 // Fusion is the extra configuration a HYBRID intent needs.
@@ -211,7 +214,9 @@ func parseFusion(intentID string, raw []byte) (*Fusion, error) {
 // UseSpecs installs database-loaded configs as the live registry, replacing
 // the compiled-in intentConfigs map.
 //
-// Called once at startup, after LoadSpecs. Separate from LoadSpecs so that
+// Called at startup, after LoadSpecs, and again at every epoch start (the
+// intent catalog reload), atomically: asks read the registry concurrently.
+// Separate from LoadSpecs so that
 // reading the table and committing to it are distinct: a node can load, check
 // what it got, and decline — an empty or partial table should leave the
 // compiled-in map in place rather than silently disabling every intent.
@@ -226,54 +231,7 @@ func UseSpecs(specs map[string]IntentConfig) {
 		// failing rather than like a configuration mistake.
 		return
 	}
-	intentConfigs = specs
-}
-
-// truthFactory builds one kind of ground-truth fetcher from its parameters.
-type truthFactory func(params map[string]any) (TruthSource, error)
-
-// truthFactories is the fixed set of ground-truth fetchers a spec may name.
-//
-// This registry is deliberately CODE rather than data, and the boundary is the
-// whole design. What varies per intent — which CAISO node, which Chainlink
-// feed, which World Bank indicator — is parameters, so a new node or feed is a
-// database row. What does NOT vary is how each upstream misbehaves, and that is
-// not expressible as configuration: OASIS answers a "+0000" timezone with HTTP
-// 200 and a ZIP whose single entry is an error document rather than a price;
-// Chainlink reports at its own decimals() and needs an ABI decode; hashprice is
-// derived from a block header's difficulty bits. Each of those cost a debugging
-// session and is pinned by a test.
-//
-// So: a new SOURCE is a reviewed Go change with a test. A new instance of an
-// existing source is a row. Adding a factory here is the rare case.
-var truthFactories = map[string]truthFactory{
-	"ecb": func(map[string]any) (TruthSource, error) {
-		return NewECBSource(), nil
-	},
-	"osrm": func(map[string]any) (TruthSource, error) {
-		return NewOSRMSource(), nil
-	},
-}
-
-// NewTruthSource builds the named truth source with the given parameters.
-func NewTruthSource(name string, params map[string]any) (TruthSource, error) {
-	f, ok := truthFactories[name]
-	if !ok {
-		known := make([]string, 0, len(truthFactories))
-		for k := range truthFactories {
-			known = append(known, k)
-		}
-		return nil, fmt.Errorf("unknown truth source %q (known: %s)", name, strings.Join(known, ", "))
-	}
-	return f(params)
-}
-
-// RegisterTruthFactory adds a fetcher to the registry.
-//
-// Exported so each intent's own file registers its source next to the parsing
-// code that understands it, rather than this file importing all of them.
-func RegisterTruthFactory(name string, f truthFactory) {
-	truthFactories[name] = f
+	liveConfigs.Store(&specs)
 }
 
 // keyParams returns truth_params.key_params as strings by question key, for
@@ -301,22 +259,4 @@ func keyParams(params map[string]any) map[string]map[string]string {
 		out[key] = kp
 	}
 	return out
-}
-
-// paramString reads a string parameter, falling back to def when absent.
-//
-// Params arrive as decoded JSON, so a number written unquoted in the spec
-// arrives as float64 rather than string. Accepting only the right type here
-// means a mistyped spec fails at load with the intent named, not at scoring
-// time with a confusing zero.
-func paramString(params map[string]any, key, def string) string {
-	v, ok := params[key]
-	if !ok {
-		return def
-	}
-	s, ok := v.(string)
-	if !ok {
-		return def
-	}
-	return s
 }

@@ -1,0 +1,25 @@
+[package]
+name = "foundation_engine"
+version = "0.1.0"
+edition = "2021"
+description = "The shared Foundation Model engine: a WASI reactor that loads one foundation ONNX graph with LoRA inputs once and scores many Evaluator adapters (safetensors delta packages) on it."
+publish = false
+
+# Telegraph ABI 2 (lora-v1). The node (pkg/wasm/runtime/foundation.go) calls, in order:
+#   _initialize, telegraph_abi, tg_alloc/load_foundation/tg_free once, then per adapter
+#   tg_alloc/load_adapter/tg_free, per score tg_alloc/score/tg_free, and unload_adapter.
+# Build with ../build_engine.sh, which pins the toolchain and remaps paths.
+
+[lib]
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+# The ONNX engine (pure Rust, no CPU-specific dispatch).
+oxionnx = { version = "=0.1.7", default-features = false }
+serde_json = "=1.0.154"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

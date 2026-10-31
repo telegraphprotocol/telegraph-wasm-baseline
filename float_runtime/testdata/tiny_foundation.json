@@ -1,0 +1,28 @@
+{
+  "foundation_version": "tiny-stub-v1",
+  "foundation_hash": "dcaaee49c8f17d62c7da0b49783a328475e90c500c32856d725d65ef30a6e17b",
+  "onnx": "tiny_foundation.onnx",
+  "bytes": 10679,
+  "r_max": 16,
+  "num_layers": 2,
+  "hidden_size": 8,
+  "tokenizer_hash": "67bc76f8b9386efba1a761c1c8e5ad439fd0eaf1c2826e9dd1a205c7af4dc456",
+  "targets": {
+    "attn.Wqkv": [
+      8,
+      24
+    ],
+    "attn.Wo": [
+      8,
+      8
+    ],
+    "mlp.Wi": [
+      8,
+      24
+    ],
+    "mlp.Wo": [
+      12,
+      8
+    ]
+  }
+}

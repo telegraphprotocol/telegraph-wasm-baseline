@@ -50,18 +50,7 @@ type promptView struct {
 // UserMessage renders the per-call message: the raw response, the field's
 // format and the reply shape. The field must already be filled (Fill).
 func UserMessage(fl Field, body string) string {
-	view := promptView{
-		Name: fl.Name, Description: fl.Description, Type: fl.Type,
-		Units: fl.Units(), TrueWhen: fl.TrueWhen, Allowed: fl.Allowed,
-	}
-	var buf bytes.Buffer
-	enc := json.NewEncoder(&buf)
-	// Python's json.dumps(..., indent=2, ensure_ascii=False): no HTML escaping
-	// of < > &, non-ASCII written as is, two-space indent.
-	enc.SetEscapeHTML(false)
-	enc.SetIndent("", "  ")
-	_ = enc.Encode(view) // a struct of strings cannot fail to encode
-	viewJSON := strings.TrimSuffix(buf.String(), "\n")
+	viewJSON := formatView(fl)
 
 	var shape string
 	switch fl.Type {
@@ -75,4 +64,54 @@ func UserMessage(fl Field, body string) string {
 	return "API response:\n" + body + "\n\n" +
 		"Format of the value wanted:\n" + viewJSON + "\n\n" +
 		"Reply with exactly this JSON:\n" + shape + `   (or {"value": null} if it is not in the response)`
+}
+
+// formatView is the field as the model sees it, as JSON.
+func formatView(fl Field) string {
+	view := promptView{
+		Name: fl.Name, Description: fl.Description, Type: fl.Type,
+		Units: fl.Units(), TrueWhen: fl.TrueWhen, Allowed: fl.Allowed,
+	}
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	// Python's json.dumps(..., indent=2, ensure_ascii=False): no HTML escaping
+	// of < > &, non-ASCII written as is, two-space indent.
+	enc.SetEscapeHTML(false)
+	enc.SetIndent("", "  ")
+	_ = enc.Encode(view) // a struct of strings cannot fail to encode
+	return strings.TrimSuffix(buf.String(), "\n")
+}
+
+// ProcessSystemPrompt is the instruction for a processed field
+// (Field.Processed): work one value out of an API response for a request,
+// citing the values used. Copying keeps SystemPrompt; this is for a value the
+// response does not hold as written. Code checks every cited value is in the
+// response (the request, which the caller writes, is never evidence).
+const ProcessSystemPrompt = "You work out one value from an API response, for a request.\n" +
+	"You are given the request, the API response and the format of the value wanted: its name, a description, " +
+	"its type and the unit(s) it can be in.\n" +
+	"Rules:\n" +
+	"1. Work out the one value the description asks for, for this request. Use every detail in the request and " +
+	"the description: which item, which place, which period or window, which threshold.\n" +
+	"2. Use only what is written in the API response; the request only says which item, place or period. " +
+	"Never guess or use outside knowledge.\n" +
+	"3. If the value is written in the response, copy it exactly. If it has to be worked out (a total, an " +
+	"average, a minimum or maximum, a count, a difference, a comparison with the request), work it out from " +
+	"the values in the response.\n" +
+	"4. A number: reply the number alone, in the first listed unit.\n" +
+	"5. A yes/no value (type bool): reply true or false.\n" +
+	"6. An enum: reply one of the allowed values.\n" +
+	"7. In \"from\", list every value you used, each copied exactly as written in the response.\n" +
+	"8. If the response does not hold what the value needs, reply null.\n" +
+	"Reply with the JSON object only. No explanation, no code fences."
+
+// ProcessUserMessage renders a processed field's message: the request, the raw
+// response, the field's format and the reply shape.
+func ProcessUserMessage(fl Field, body, request string) string {
+	return "Request:\n" + request + "\n\n" +
+		"API response:\n" + body + "\n\n" +
+		"Format of the value wanted:\n" + formatView(fl) + "\n\n" +
+		"Reply with exactly this JSON:\n" +
+		`{"value": "<the value>", "from": ["<each value used, exactly as written>", ...]}` +
+		`   (or {"value": null} if the response does not hold it)`
 }

@@ -2,6 +2,7 @@ package adapterbuild
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -116,10 +117,37 @@ func TestLoadTrainingRecord(t *testing.T) {
 	}
 }
 
-// Build refuses before packaging, writing nothing.
-func TestBuildRequireTrainingRecordRefuses(t *testing.T) {
+// withTraining writes a copy of the tiny judgment fixture with rec embedded
+// in its safetensors metadata (as export_adapter --training-record does).
+func withTraining(t *testing.T, rec *wasmrt.TrainingRecord) string {
+	t.Helper()
+	src := filepath.Join(loraFixtures, "tiny_judgment.safetensors")
+	b, err := os.ReadFile(src)
+	if err != nil {
+		t.Skipf("fixture missing: %v", err)
+	}
+	hl := int(binary.LittleEndian.Uint64(b[:8]))
+	var h map[string]any
+	if err := json.Unmarshal(b[8:8+hl], &h); err != nil {
+		t.Fatal(err)
+	}
+	rj, _ := json.Marshal(rec)
+	h["__metadata__"].(map[string]any)["training"] = string(rj)
+	hj, _ := json.Marshal(h)
+	n := binary.LittleEndian.AppendUint64(nil, uint64(len(hj)))
+	n = append(n, hj...)
+	n = append(n, b[8+hl:]...)
+	out := filepath.Join(t.TempDir(), "CODE_REVIEW.safetensors")
+	if err := os.WriteFile(out, n, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+// CheckLoRA refuses before writing a manifest.
+func TestCheckLoRARequireTrainingRecordRefuses(t *testing.T) {
 	useTrainingCatalog(t)
-	out := t.TempDir()
+	fnd := filepath.Join(loraFixtures, "tiny_foundation.json")
 	for _, c := range []struct {
 		name string
 		rec  *wasmrt.TrainingRecord
@@ -130,41 +158,36 @@ func TestBuildRequireTrainingRecordRefuses(t *testing.T) {
 		{"missing child", trainingFor("CODE_REVIEW", "CODE_REVIEW"), "missing"},
 		{"family mismatch", trainingFor("CODE_REVIEW_GO", "CODE_REVIEW_GO"), "--intent is CODE_REVIEW"},
 	} {
-		_, _, err := Build(context.Background(), Req{Intent: "CODE_REVIEW", IMWQPath: fixtureIMWQ(t), OutDir: out, HostsDir: committedHosts(t),
-			Training: c.rec, RequireTraining: true}, t.Logf)
+		pkg := filepath.Join(loraFixtures, "tiny_judgment.safetensors")
+		if c.rec != nil {
+			pkg = withTraining(t, c.rec)
+		}
+		out := t.TempDir()
+		_, _, err := CheckLoRA(context.Background(), LoRAReq{Intent: "CODE_REVIEW", PackagePath: pkg, FoundationPath: fnd, OutDir: out,
+			RequireTraining: true}, t.Logf)
 		if err == nil || !strings.Contains(err.Error(), c.want) {
 			t.Errorf("%s: err=%v, want containing %q", c.name, err, c.want)
 		}
-		assertNothingWritten(t, out, "CODE_REVIEW")
+		if entries, _ := os.ReadDir(out); len(entries) != 0 {
+			t.Errorf("%s: a refused check wrote %d files", c.name, len(entries))
+		}
 	}
 }
 
-// The record lands in the package's telegraph.adapter section (the one
-// section, read back by the node's own reader) and in the manifest.
-func TestBuildEmbedsAndEchoesTrainingRecord(t *testing.T) {
+// The record embedded in the package (read back by the node's own parser)
+// lands in the manifest; --training-record must equal it.
+func TestCheckLoRAEchoesTrainingRecord(t *testing.T) {
 	useTrainingCatalog(t)
+	fnd := filepath.Join(loraFixtures, "tiny_foundation.json")
 	rec := trainingFor("CODE_REVIEW", allServed...)
-	a, m, err := Build(context.Background(), Req{Intent: "CODE_REVIEW", IMWQPath: fixtureIMWQ(t), OutDir: t.TempDir(),
-		HostsDir: committedHosts(t), Training: rec, RequireTraining: true}, t.Logf)
+	pkg := withTraining(t, rec)
+	a, m, err := CheckLoRA(context.Background(), LoRAReq{Intent: "CODE_REVIEW", PackagePath: pkg, FoundationPath: fnd, OutDir: t.TempDir(),
+		Training: rec, RequireTraining: true}, t.Logf)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if m.Training == nil || strings.Join(m.Training.ChildIntents(), ",") != strings.Join(allServed, ",") {
 		t.Fatalf("manifest training = %+v", m.Training)
-	}
-	b, err := os.ReadFile(a.Path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	meta, err := wasmrt.ReadAdapterMeta(b)
-	if err != nil || meta == nil || meta.Training == nil {
-		t.Fatalf("section: %+v, %v", meta, err)
-	}
-	if got, want := string(meta.Encode()), string((wasmrt.AdapterMeta{ABIVersion: 1, Class: "judgment", Tool: "wideembed", Training: rec}).Encode()); got != want {
-		t.Fatalf("section payload:\n got %s\nwant %s", got, want)
-	}
-	if err := meta.Check("judgment"); err != nil {
-		t.Fatalf("node-side Check: %v", err)
 	}
 	raw, _ := os.ReadFile(a.ManifestPath)
 	var generic map[string]any
@@ -174,17 +197,15 @@ func TestBuildEmbedsAndEchoesTrainingRecord(t *testing.T) {
 	if tr, ok := generic["training"].(map[string]any); !ok || tr["family"] != "CODE_REVIEW" {
 		t.Fatalf("on-disk manifest training = %v", generic["training"])
 	}
-	// A build without a record has no training key (byte-identical section).
-	a2, m2, err := Build(context.Background(), Req{Intent: "CODE_REVIEW", IMWQPath: fixtureIMWQ(t), OutDir: t.TempDir(), HostsDir: committedHosts(t)}, t.Logf)
-	if err != nil {
-		t.Fatal(err)
+	other := trainingFor("CODE_REVIEW", "CODE_REVIEW")
+	if _, _, err := CheckLoRA(context.Background(), LoRAReq{Intent: "CODE_REVIEW", PackagePath: pkg, FoundationPath: fnd, OutDir: t.TempDir(),
+		Training: other}, t.Logf); err == nil || !strings.Contains(err.Error(), "differs from the record embedded") {
+		t.Fatalf("mismatched --training-record: %v", err)
 	}
-	b2, _ := os.ReadFile(a2.Path)
-	meta2, _ := wasmrt.ReadAdapterMeta(b2)
-	if m2.Training != nil || meta2 == nil || string(meta2.Encode()) != `{"abi_version":1,"class":"judgment","tool":"wideembed"}` {
-		t.Fatalf("no-record build: manifest training %+v, section %s", m2.Training, meta2.Encode())
-	}
-	if a2.SHA256 == a.SHA256 {
-		t.Fatal("the record must change the package bytes (it is inside the hashed module)")
+	// A package without a record has no training key in its manifest.
+	_, m2, err := CheckLoRA(context.Background(), LoRAReq{Intent: "CODE_REVIEW", PackagePath: filepath.Join(loraFixtures, "tiny_judgment.safetensors"),
+		FoundationPath: fnd, OutDir: t.TempDir()}, t.Logf)
+	if err != nil || m2.Training != nil {
+		t.Fatalf("no-record package: training %+v err %v", m2.Training, err)
 	}
 }

@@ -1,193 +1,302 @@
-# Telegraph scoring adapter kit
+# Telegraph Evaluator Adapter Kit
 
-This repository builds a V2 scoring adapter for a Telegraph `judgment` or
-`hybrid` intent. An adapter receives the canonical rendered question and a
-miner answer from the node, then returns one model score. It is a candidate
-until the node has structurally validated it, run its smoke score, and passed
-it through the intent's evaluation material.
+> **Changed (2026-10-30): full-model float `.wasm` adapters are no longer accepted;
+> repackage as a delta.** An Evaluator adapter is now a **safetensors delta package**
+> (a few MB of LoRA deltas and a reward head) that validators run on one shared
+> **Foundation Model**. Nodes reject a full-model `.wasm` (the ~600 MB model baked into a
+> WASI command) with `legacy_full_model`, and an adapter already Active in that format is
+> taken out of service when a validator upgrades. Re-export the delta from your original
+> training run (the `adapter/` folder `train_adapter` wrote; the reward head is read from
+> it or from `reward_head.pt`) with `export_adapter.py`, no retraining needed, and register
+> it again. No checkpoint: retrain. The full-model tools (`export_onnx.py`, `bake_wasm.sh`,
+> the `vm_float_wasm` crate) are removed; they remain in git history only.
 
-The current format is an ONNX FP32 ModernBERT reward model baked into a
-restricted WASI WebAssembly command. It is identified by this metadata:
+Everything you need to build an **Evaluator adapter** for a Telegraph judgment or hybrid
+intent: the model that reads a question and a miner's answer and scores how good the
+answer is. Register a better one than the current adapter and it replaces it.
+
+Full guide: [Train an Evaluator Adapter](https://docs.telegraphprotocol.com/docs/scoring/train-a-scoring-adapter).
+Upgrading from a full-model adapter:
+[Upgrading to the shared Foundation Model](https://docs.telegraphprotocol.com/docs/scoring/upgrade-shared-foundation).
+
+## The workflow
+
+| Step | Tool | Output |
+|---|---|---|
+| 1. Train | `float_runtime/train_adapter.py` | a PEFT LoRA adapter and `reward_head.pt` |
+| 2. Export the delta | `float_runtime/export_adapter.py` (never merges the base weights) | `<INTENT>.safetensors` |
+| 3. Check and package | `cmd/adapterbuild lora` (the node's own parser) | the keccak256 to register, a manifest |
+| 4. Host the file | any `https://` or `ipfs://` URL | `wasmUrl` |
+| 5. Run the executor | `cmd/adapterexec` (reference) | `wasmRunnableUrl` |
+| 6. Register | `registerWasm(keccak256, wasmUrl, prefix, feeAddress, wasmRunnableUrl)` | a registration id |
+| 7. The node checks | remote check, download, Stage 1, confirmation, hidden competition | Active, or a rejection reason |
+
+From the root of this repository (on Windows, run `bash` steps from Git Bash):
+
+```bash
+pip install -r requirements.txt
+
+# 1. train (pairs.jsonl: one {"prompt", "chosen", "rejected"} per line; GPU recommended)
+python -m float_runtime.train_adapter --intent CODE_REVIEW --data pairs.jsonl --out runs/CODE_REVIEW
+
+# 2. export the delta for the validators' Foundation Model (CPU, seconds)
+python -m float_runtime.export_adapter --run runs/CODE_REVIEW --intent CODE_REVIEW \
+  --class judgment --foundation foundation/foundation.json
+
+# 3. check it the way a node will, and get the hash to register
+go run ./cmd/adapterbuild lora --intent CODE_REVIEW \
+  --package runs/CODE_REVIEW/CODE_REVIEW.safetensors --foundation foundation/foundation.json \
+  [--foundation-onnx foundation/foundation_lora_fp32.onnx --engine float_runtime/engine/foundation_engine.wasm]
+```
+
+Check your data before spending GPU time:
+`python -m float_runtime.train_adapter --intent CODE_REVIEW --data pairs.jsonl --check-data`.
+Each step prints the next command.
+
+### 1. Train
+
+`train_adapter.py` fine-tunes `answerdotai/ModernBERT-base` with plain PEFT LoRA (rank 8,
+alpha 32 by default) and a one-logit reward head on preference pairs, behind a dataset
+gate and an evaluation gate (at least 65% held-out pairwise accuracy and 10 points over
+"pick the longer answer"). It trains at 512 tokens by default, the most the node scores.
+It writes the PEFT adapter, `reward_head.pt`, and `result.json` with the base model's and
+the tokenizer's sha256.
+
+The LoRA must be plain PEFT LoRA: `r <= 16`, `target_modules` among `Wqkv`, `Wo`, `Wi`,
+one `lora_alpha` (no `rank_pattern`, `alpha_pattern`, rsLoRA or DoRA).
+
+### 2. Export the delta
+
+`export_adapter.py --run <dir> --intent <PREFIX> --class judgment|hybrid --foundation
+foundation.json` writes `<INTENT>.safetensors`: the LoRA A/B matrices and the reward head,
+never the base weights. It refuses a run trained on another base model or tokenizer.
+If you trained shorter than 512 tokens, pass the same number as `--max-tokens`.
+`--adapter` takes a PEFT adapter directory (or a Hugging Face spec) instead of `--run`, for
+an adapter trained elsewhere.
+
+### 3. Check and package
+
+`adapterbuild lora` runs the node's Stage 1 parser on the package against
+`foundation.json`, derives the class from the intent catalog (deterministic intents are
+refused), and, with `--foundation-onnx` and `--engine`, loads the package on the foundation
+through the node's runtime and scores an input twice (identical bits required). It prints
+one JSON line on stdout (`keccak256`, `sha256`, `bytes`, `package_path`, `manifest_path`,
+`score_hex` when scored, the manifest) and writes `<INTENT>.safetensors.manifest.json`.
+Nothing is rewritten: the hash you register is the hash of the file `export_adapter` wrote.
+
+### 4. Host the file
+
+Upload `<INTENT>.safetensors` unchanged to an `https://` or `ipfs://` URL that serves the
+exact bytes (no re-encoding or transcoding). Validators download it within 120 s, at most
+`ADAPTER_LORA_MAX_BYTES` (64 MiB by default), and check its keccak256 against the registered
+hash: a different file is rejected on the first attempt (`wasm hash mismatch`).
+
+### 5. Run the runnable-URL executor
+
+Every registration needs a `wasmRunnableUrl`: an endpoint that runs **your package on the
+validators' Foundation Model**. A validator scores a sample there before it downloads
+anything, and later re-scores the same texts itself, bit for bit. See
+[The runnable-URL executor](#the-runnable-url-executor) below.
+
+### 6. Register
+
+```
+registerWasm(bytes32 wasmHash, string wasmUrl, string intent, address feeAddress, string wasmRunnableUrl)
+```
+
+`wasmHash` is the package's keccak256, `intent` is the family prefix the adapter serves,
+and `feeAddress` must be non-zero. Approve the adapter bond in MACHINA first: it is fixed
+in USD (`entityBonds()`), pulled by `registerWasm`, and released in full on
+deregistration. Re-registering an exact hash you already registered reverts with
+`duplicate wasm hash`; a new package is a new hash.
+
+### 7. What the node checks
+
+In this order (each failure is a terminal rejection with the reason shown, unless noted):
+
+1. **Runnable URL present**, else `wasm_runnable_url is required`.
+2. **Remote check** at `wasmRunnableUrl`, before any download. It waits (Pending, uncharged)
+   for the first confirmed epoch after the registration (`awaiting_seed_epoch`) and for
+   public evaluation material for the intent (at least 10 usable pairs). Then it sends 15
+   public pairs (up to 30 texts) in one batch request with `foundation_hash`, `adapter_hash`
+   and `tokenizer_hash`. A different echo is rejected (`identity echo mismatch`); fewer
+   than 70% of pairs ordered correctly is rejected; an unreachable or too slow endpoint
+   (`WASM_REMOTE_EVAL_BUDGET`, 30 minutes) is retried at the next epoch rollover or within
+   the hour, and rejected after 3 failed attempts.
+3. **Download and hash**: the first MiB decides the kind. A full-model `.wasm` is refused
+   at once (`legacy_full_model`); a package is read up to `ADAPTER_LORA_MAX_BYTES`; the
+   keccak256 must equal the registered hash.
+4. **Stage 1**: the package rules below against this validator's foundation and tokenizer.
+   A validator with no Foundation Model refuses every package (`no_foundation`).
+5. **Confirmation**: the validator scores the same public texts locally; every score must
+   equal the executor's bits (`remote score mismatch`), and an executor that did not echo
+   the identity is rejected (`its runnable URL did not echo the score identity`).
+6. **Competition** on the hidden evaluation split: at least 70% (60% on each child of a
+   family) and, with an incumbent, at least 2 points better than it on the same sample.
+   With no incumbent, the first adapter that clears the floor becomes the first Canonical.
+
+**Timing.** Minutes, not seconds. On a laptop CPU one 512-token text takes about 13-14 s on
+the foundation, so the remote check (up to 30 texts) is about 4-7 minutes on your executor,
+the confirmation the same again on the validator, and the hidden round (30 pairs, 60 texts)
+about 14 minutes. Waiting for the seed epoch comes on top. A local end-to-end run took about
+21 minutes from registration to Active, all of it scoring.
+
+## What the package must contain
+
+A standard safetensors file: `u64 LE header length | JSON header | raw tensor bytes`, the
+header mapping each tensor to `{dtype, shape, data_offsets}`, and the package fields in its
+`__metadata__` string map (every value a string). The node's parser is
+`pkg/wasm/runtime/lora_adapter.go`; the kit writes it with `float_runtime/lora_format.py`.
+
+| Metadata key | Rule | Rejection if wrong |
+|---|---|---|
+| `format_version` | `"1"` | `bad_version` |
+| `abi` | `"lora-v1"` | `bad_abi` |
+| `class` | `"judgment"` or `"hybrid"`, and the intent's class | `class_mismatch` |
+| `intent` | the prefix the adapter serves, not empty | `bad_header` |
+| `foundation_hash` | sha256 of the validators' foundation graph | `foundation_mismatch` |
+| `foundation_version` | the foundation's version label | (informational) |
+| `tokenizer_hash` | sha256 of ModernBERT's `tokenizer.json` (below) | `tokenizer_mismatch` |
+| `rank` | 1 to `R_MAX` (16) | `rank_too_large` |
+| `alpha` | a positive finite number | `bad_header` |
+| `target_modules` | a JSON array string, each of `Wqkv`, `Wo`, `Wi` at most once | `bad_target_module` |
+| `max_tokens` | 1 to 512 | `bad_max_tokens` |
+| `training` | optional training record as a JSON string, shape-checked only | `training_record` |
+| `x-*` | optional extension keys, ignored | any other key: `bad_header` |
+
+A missing required key is `missing_metadata`; a file that is not safetensors is
+`bad_container`.
+
+Tensors, all dtype `F32` (`bad_dtype` otherwise), for the 22-layer ModernBERT-base
+foundation (hidden size 768), rank `r`:
+
+| Tensor | Shape |
+|---|---|
+| `lora.<l>.attn.Wqkv.A` / `.B` | `[768, r]` / `[r, 2304]` |
+| `lora.<l>.attn.Wo.A` / `.B` | `[768, r]` / `[r, 768]` |
+| `lora.<l>.mlp.Wi.A` / `.B` | `[768, r]` / `[r, 2304]` |
+| `lora.<l>.mlp.Wo.A` / `.B` | `[1152, r]` / `[r, 768]` |
+| `head.weight` | `[768, 1]` |
+| `head.bias` | `[1]` |
+
+`l` runs 0 to 21, so a package has exactly 178 tensors. B is stored pre-transposed. Every
+tensor of every target is required whatever `target_modules` says (PEFT's `Wo` matches
+both `attn.Wo` and `mlp.Wo`). Missing, repeated or misshapen tensors are `bad_shape`; the
+tensors must tile the data contiguously with nothing left over (`bad_offsets`,
+`trailing_bytes`, `truncated`); every value must be finite (`non_finite`).
+
+**Size**: at most `ADAPTER_LORA_MAX_BYTES` (default 64 MiB, `too_large`). A rank-8
+package is 6.8 MB.
+
+## Current foundation and tokenizer
+
+| | Value | Status |
+|---|---|---|
+| Tokenizer `tokenizer_hash` | `67bc76f8b9386efba1a761c1c8e5ad439fd0eaf1c2826e9dd1a205c7af4dc456` | pinned in the node (`answerdotai/ModernBERT-base` `tokenizer.json`) |
+| Engine `FOUNDATION_ENGINE_WASM_HASH` | `77643d6e1176ab8744801cef93ccb844d0136ed32b8daa865d541f37d13292de` | what `bash float_runtime/build_engine.sh` builds from this branch (2,686,528 B); also committed as `float_runtime/engine/foundation_engine.wasm` |
+| Foundation `foundation_hash` | reference export: `0a49b325304bb4cf292e683929689d0457966be264f60bfc94d0072b614bf8e6` (`modernbert-base-lora16-v1`, 599,117,769 B) | the hash validators run is announced with the foundation release: TBD |
+
+**How to obtain the foundation: TBD.** The Foundation Model (`foundation_lora_fp32.onnx`)
+and its `foundation.json` are published by the Telegraph team; the download location is not
+decided yet. Adapter authors need only `foundation.json` (1-2 KB: the hash, version,
+tokenizer hash and LoRA layout); executor operators need the `.onnx` and the engine too.
+Until then, `python -m float_runtime.export_foundation --out foundation/` builds one locally
+from the public base model (needs a few GB of RAM). A package is only accepted if its
+`foundation_hash` equals the one validators run; whether a local export reproduces the
+published file byte for byte is not verified.
+
+## The runnable-URL executor
+
+`cmd/adapterexec` is the reference: it loads the foundation and your package with the node's
+own runtime and serves the batch request. Validators test with the same code
+(`wasm-remote-exec --kind float` in the node repository).
+
+```bash
+export FOUNDATION_MODEL_PATH=foundation/foundation_lora_fp32.onnx
+export FOUNDATION_MODEL_HASH=<sha256 of it>
+export FOUNDATION_ENGINE_WASM_PATH=float_runtime/engine/foundation_engine.wasm
+export FOUNDATION_ENGINE_WASM_HASH=77643d6e1176ab8744801cef93ccb844d0136ed32b8daa865d541f37d13292de
+go run ./cmd/adapterexec --package runs/CODE_REVIEW/CODE_REVIEW.safetensors --listen 127.0.0.1:8080
+```
+
+It refuses to start when a file's sha256 differs from its pinned hash. Put it behind a TLS
+reverse proxy and register the public `https://` URL: validators refuse loopback, private,
+link-local and 100.64.0.0/10 addresses and do not follow redirects. It needs about 1.8 GB of
+RAM and scores one text at a time.
+
+**Request** (one `POST`, every question in it; at most 100 items, accept bodies up to 1 MiB):
 
 ```json
-{"abi_version":2,"runtime":"onnx_f32","class":"judgment","max_tokens":512}
+{
+  "batch": [{"tokens": [50281, 4118, 17526, 27, 187, 18658, 436, 13814, 1818, 50282]}],
+  "foundation_hash": "<sha256 of the validator's foundation graph>",
+  "adapter_hash": "<the registered keccak256, lowercase hex, no 0x>",
+  "tokenizer_hash": "<sha256 of the validator's tokenizer.json>",
+  "input_root": "<sha256 binding the batch's token inputs>"
+}
 ```
 
-The packager writes that metadata. Do not add or edit it by hand.
+The validator renders and tokenises the text itself, so the executor needs no tokenizer.
+Score each token list as given (truncated to the package's `max_tokens`).
 
-## Requirements
-
-- Python 3.10 or newer
-- Go 1.25 or newer
-- Rust with the `wasm32-wasip1` target
-- A ModernBERT base model and a compatible LoRA reward-model checkpoint
-
-Training normally needs a GPU. Exporting, baking, and packaging can run on a
-CPU, although a real model requires substantial memory.
-
-```bash
-python -m pip install -r requirements.txt
-rustup target add wasm32-wasip1
-```
-
-## Build an adapter
-
-Use the deployed intent ID, including its V2 suffix where applicable. The
-example below uses `CODE_REVIEW_GENERAL`.
-
-### 1. Train or obtain a compatible reward-model checkpoint
-
-The training utility accepts JSONL preference pairs:
+**Reply** `200`, one result per item, in the same order, and the identity at the top level:
 
 ```json
-{"prompt":"question","chosen":"better miner answer","rejected":"worse miner answer"}
+{
+  "results": [{"score": 3204838382}],
+  "foundation_hash": "<the foundation you scored with>",
+  "adapter_hash": "<the keccak256 of the package you scored with, lowercase hex, no 0x>",
+  "tokenizer_hash": "<the tokenizer hash of that package>",
+  "input_root": "<optional: the root of the tokens you received>"
+}
 ```
 
-```bash
-python -m wide_runtime.train_adapter \
-  --intent CODE_REVIEW_GENERAL \
-  --data pairs.jsonl \
-  --out runs/CODE_REVIEW_GENERAL
-```
+- `score` is the f32 bit pattern of the reward logit as an unsigned 32-bit integer
+  (`3204838382` is `0xbf05f3ee`), never a decimal. NaN and infinities are refused.
+- `{"error": "..."}` for an item your model refuses; a refused public pair rejects the
+  registration.
+- Echo what you actually ran, not what you were sent. All three fields must match the
+  request (hex, case-insensitive): a different value rejects the registration at once
+  (`identity echo mismatch`), and a missing echo rejects it after the download (`its runnable
+  URL did not echo the score identity`). `input_root` is optional, but a different one is the
+  same mismatch.
+- `4xx`, or a `200` without `results`, means "no batch support" and rejects at once.
+  `408`, `429` and `5xx` are retried later.
+- The reply is at most 64 KiB, and the whole check must finish within 30 minutes.
 
-Before training, run the data checks alone if desired:
+The scores must be the exact bits the validators' engine computes, so run the same
+foundation, engine and package (as `adapterexec` does). A different runtime (for example
+native ONNX Runtime) gives close but not identical bits, and the confirmation rejects it.
 
-```bash
-python -m wide_runtime.train_adapter \
-  --intent CODE_REVIEW_GENERAL \
-  --data pairs.jsonl \
-  --check-data
-```
+## Needs
 
-### 2. Export the merged model to ONNX
+- Python 3.10+ (training and export; a GPU for training),
+- Go 1.25+ (`adapterbuild`, `adapterexec`),
+- Rust via [rustup](https://rustup.rs) with the `wasm32-wasip1` target, only to rebuild the
+  engine (`build_engine.sh`; the pinned 1.98.1 toolchain is installed automatically).
 
-`export_onnx` merges the LoRA checkpoint with ModernBERT and exports one
-dynamic-length ONNX graph. It does not train or alter checkpoint weights.
+## What's in here
 
-```bash
-python -m wide_runtime.export_onnx \
-  --base answerdotai/ModernBERT-base \
-  --adapter runs/CODE_REVIEW_GENERAL/adapter \
-  --out runs/CODE_REVIEW_GENERAL/model.onnx
-```
+| Path | What |
+|---|---|
+| `float_runtime/train_adapter.py` | Trains a ModernBERT LoRA reward model from preference pairs, behind a dataset gate and an evaluation gate; writes the PEFT adapter and `reward_head.pt` |
+| `float_runtime/export_adapter.py` | Writes the safetensors delta package for a foundation (never merges the base weights) |
+| `float_runtime/lora_format.py` | The package layout: metadata schema, tensor names, writer, reader |
+| `float_runtime/export_foundation.py` | One-time: builds the Foundation Model ONNX with LoRA inputs and `foundation.json` |
+| `float_runtime/engine/`, `float_runtime/build_engine.sh` | The foundation engine (a WASI reactor around `oxionnx`) and its pinned build |
+| `cmd/adapterbuild` | `adapterbuild lora`: checks a package with the node's own code and prints the keccak256 to register |
+| `cmd/adapterexec` | The reference runnable-URL executor |
+| `pkg/` | The Go code both commands use, including copies of the Telegraph node's parser, runtime and remote-check client, so a package is checked and served exactly as a node runs it |
+| `float_runtime/README.md` | Technical reference: the package format, the engine ABI, the scoring contract, determinism, limits |
+| `float_runtime/testdata/` | A few-KB stub foundation and tiny delta packages (`make_tiny_foundation.py`) for the tests; the tokenizer conformance vectors |
+| `scripts/sync-node-packages.sh` | Re-copies the node packages under `pkg/` from a Telegraph checkout |
+| `legacy/v1-minilm/` | The retired V1 MiniLM `rank_answer` module. Nodes no longer accept it. Kept for reference only |
 
-The export command also writes `model.onnx.export.json`, including its input
-and output contract and a reference score. Keep it with the build records.
+## Same result as the node
 
-### 3. Bake the ONNX graph into a WASI module
-
-```bash
-mkdir -p runs/CODE_REVIEW_GENERAL
-wide_runtime/vm_float_wasm/bake_wasm.sh \
-  runs/CODE_REVIEW_GENERAL/model.onnx \
-  runs/CODE_REVIEW_GENERAL/model.baked.wasm
-```
-
-The guest has no network access and receives only the node-provided input
-file. It accepts `input_ids` and `attention_mask` and emits one finite FP32
-score. The node sets the token IDs, attention mask, command arguments, wall
-clock, I/O limits, and memory limits; an adapter cannot choose them.
-
-### 4. Package the artifact
-
-```bash
-go run ./cmd/adapterbuild \
-  --intent CODE_REVIEW_GENERAL \
-  --baked-wasm runs/CODE_REVIEW_GENERAL/model.baked.wasm \
-  --out runs/CODE_REVIEW_GENERAL
-```
-
-This writes:
-
-```text
-runs/CODE_REVIEW_GENERAL/CODE_REVIEW_GENERAL.wasm
-runs/CODE_REVIEW_GENERAL/CODE_REVIEW_GENERAL.wasm.manifest.json
-```
-
-`adapterbuild` refuses a module that is not a WASI command, already contains
-adapter metadata, exports retired Q32.32 functions, or cannot compile under
-wazero. It packages twice and requires byte-identical output. The resulting
-manifest contains the SHA-256 hash, Keccak-256 hash, declared class, ABI,
-runtime, token cap, and build provenance.
-
-Use `--max-tokens N` only to lower the cap for this artifact; accepted values
-are 1 through 512. The default is 512.
-
-The intent class is resolved from the catalog. `--class judgment` or
-`--class hybrid` is optional and only asserts the expected class; it cannot
-override the node's live intent classification. A class mismatch is a failed
-build or registration, not a fallback.
-
-## Verify before submission
-
-Run the kit tests:
-
-```bash
-go test ./...
-```
-
-Check the package and manifest before publishing them:
-
-```bash
-shasum -a 256 runs/CODE_REVIEW_GENERAL/CODE_REVIEW_GENERAL.wasm
-cat runs/CODE_REVIEW_GENERAL/CODE_REVIEW_GENERAL.wasm.manifest.json
-```
-
-The node performs additional checks when the candidate is submitted:
-
-1. It verifies ABI v2, `onnx_f32`, the intent class, the token cap, module
-   imports, exports, and size limits.
-2. It runs a fixed smoke input. A module that traps, emits malformed output,
-   or returns a non-finite result is rejected.
-3. It evaluates a valid candidate against the intent's evaluation material.
-   Lack of compatible material leaves the candidate pending; it is not a pass.
-
-A successfully packaged file is therefore not automatically active or ranked.
-
-## Publish and submit
-
-`adapterbuild --publish` uploads a built artifact and its manifest to the
-configured S3-compatible object store. It does not activate the adapter.
-
-```bash
-OBJECT_STORE_ENDPOINT=https://object-store.example \
-OBJECT_STORE_BUCKET=telegraph-adapters \
-OBJECT_STORE_ACCESS_KEY=... \
-OBJECT_STORE_SECRET_KEY=... \
-go run ./cmd/adapterbuild \
-  --intent CODE_REVIEW_GENERAL \
-  --artifact runs/CODE_REVIEW_GENERAL/CODE_REVIEW_GENERAL.wasm \
-  --publish
-```
-
-Submit the resulting immutable URL and Keccak-256 hash through the Telegraph
-V2 adapter-registration flow. Do not replace bytes at a URL that has already
-been registered: validators verify downloaded bytes against the registered
-hash. The publisher rejects replacing different bytes unless `--overwrite` is
-explicitly provided.
-
-## Determinism and compatibility
-
-The FP32 model path is the supported V2 format. Packaging is reproducible for
-the same baked input, but model-score bit identity across arbitrary CPUs and
-runtimes is not established by this kit. Do not claim cross-machine
-bit-identical inference without an end-to-end test against the target node
-versions and CPU environments.
-
-The retired Q32.32 `.imwq` tooling remains in `wide_runtime/wide_wasm` only as
-historical reference. V2 model adapters must use the ONNX/WASI path above.
-
-## Repository layout
-
-| Path | Purpose |
-| --- | --- |
-| `wide_runtime/train_adapter.py` | Trains a ModernBERT LoRA reward model from preference pairs. |
-| `wide_runtime/export_onnx.py` | Merges and exports the trained model to ONNX. |
-| `wide_runtime/vm_float_wasm/` | Restricted WASI guest and bake script. |
-| `cmd/adapterbuild` | Adds V2 metadata, verifies the module, writes the artifact and manifest, and optionally publishes. |
-| `pkg/adapterbuild/` | Builder, catalog-class, manifest, and publish checks. |
-| `pkg/wasm/runtime/` | Shared package metadata validation used by the kit. |
-| `wide_runtime/wide_wasm/` | Retired Q32.32 implementation; not the V2 model path. |
+The code under `pkg/wasm/runtime`, `pkg/wasm/wasmbin`, `pkg/wasm/remote`, `pkg/scoring` and
+`pkg/engine/llm` is copied from the Telegraph node, unchanged apart from import paths. When
+the node's copy changes, run `bash scripts/sync-node-packages.sh <path/to/Telegraph>`.
 
 ## License
 
