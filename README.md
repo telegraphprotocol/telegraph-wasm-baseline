@@ -136,7 +136,7 @@ In this order (each failure is a terminal rejection with the reason shown, unles
    With no incumbent, the first adapter that clears the floor becomes the first Canonical.
 
 **Timing.** Minutes, not seconds. On a laptop CPU one 512-token text takes about 13-14 s on
-the foundation, so the remote check (up to 30 texts) is about 4-7 minutes on your executor,
+the foundation, so the remote check (up to 30 texts) is up to about 7 minutes on your executor,
 the confirmation the same again on the validator, and the hidden round (30 pairs, 60 texts)
 about 14 minutes. Waiting for the seed epoch comes on top. A local end-to-end run took about
 21 minutes from registration to Active, all of it scoring.
@@ -194,22 +194,24 @@ package is 6.8 MB.
 |---|---|---|
 | Tokenizer `tokenizer_hash` | `67bc76f8b9386efba1a761c1c8e5ad439fd0eaf1c2826e9dd1a205c7af4dc456` | pinned in the node (`answerdotai/ModernBERT-base` `tokenizer.json`) |
 | Engine `FOUNDATION_ENGINE_WASM_HASH` | `77643d6e1176ab8744801cef93ccb844d0136ed32b8daa865d541f37d13292de` | what `bash float_runtime/build_engine.sh` builds from this branch (2,686,528 B); also committed as `float_runtime/engine/foundation_engine.wasm` |
-| Foundation `foundation_hash` | reference export: `0a49b325304bb4cf292e683929689d0457966be264f60bfc94d0072b614bf8e6` (`modernbert-base-lora16-v1`, 599,117,769 B) | the hash validators run is announced with the foundation release: TBD |
+| Foundation `foundation_hash` | reference export: `0a49b325304bb4cf292e683929689d0457966be264f60bfc94d0072b614bf8e6` (`modernbert-base-lora16-v1`, 599,117,769 B) | the hash validators run is published with the foundation (not yet) |
 
-**How to obtain the foundation: TBD.** The Foundation Model (`foundation_lora_fp32.onnx`)
-and its `foundation.json` are published by the Telegraph team; the download location is not
-decided yet. Adapter authors need only `foundation.json` (1-2 KB: the hash, version,
-tokenizer hash and LoRA layout); executor operators need the `.onnx` and the engine too.
-Until then, `python -m float_runtime.export_foundation --out foundation/` builds one locally
-from the public base model (needs a few GB of RAM). A package is only accepted if its
-`foundation_hash` equals the one validators run; whether a local export reproduces the
-published file byte for byte is not verified.
+**How to obtain the foundation.** The engine is in this repository
+(`float_runtime/engine/foundation_engine.wasm`) and the tokenizer is ModernBERT-base's public
+`tokenizer.json`. The Foundation Model (`foundation_lora_fp32.onnx`) and its `foundation.json`
+are **not published yet**: the Telegraph team will publish them, with the hash every
+validator must run, at a public location announced with the deploy. Adapter authors need
+only `foundation.json` (1-2 KB: the hash, version, tokenizer hash and LoRA layout);
+executor operators need the `.onnx` and the engine too.
+`python -m float_runtime.export_foundation --out foundation/` builds one locally from the
+public base model (needs a few GB of RAM), for experiments only: a local export is not
+guaranteed to have the published hash, and a package built against a different hash is
+rejected (`foundation_mismatch`).
 
 ## The runnable-URL executor
 
 `cmd/adapterexec` is the reference: it loads the foundation and your package with the node's
-own runtime and serves the batch request. Validators test with the same code
-(`wasm-remote-exec --kind float` in the node repository).
+own runtime (the copy under `pkg/`) and serves the batch request validators send.
 
 ```bash
 export FOUNDATION_MODEL_PATH=foundation/foundation_lora_fp32.onnx
