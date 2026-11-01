@@ -14,6 +14,8 @@ func TestResolveClass(t *testing.T) {
 		{"CODE_REVIEW", "judgment", "judgment"},
 		{"CODE_REVIEW_GENERAL", "", "judgment"},
 		{"EMAIL_SECURITY_GENERAL", "", "hybrid"},
+		{"GENERIC", "", "judgment"},
+		{"GENERIC", "judgment", "judgment"},
 	}
 	for _, c := range ok {
 		got, err := ResolveClass(c.intent, c.explicit)
@@ -24,6 +26,7 @@ func TestResolveClass(t *testing.T) {
 	bad := []struct{ intent, explicit, wantErr string }{
 		{"VULNERABILITY_TRIAGE", "judgment", "disagrees"},
 		{"CODE_REVIEW", "hybrid", "disagrees"},
+		{"GENERIC", "hybrid", "disagrees"},
 		{"FX_NOW", "", "deterministic"},
 		{"ROUTE_ETA", "hybrid", "deterministic"},
 		{"NOT_AN_INTENT", "", "not a judgment or hybrid intent"},

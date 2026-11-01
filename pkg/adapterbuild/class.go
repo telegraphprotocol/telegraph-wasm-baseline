@@ -67,9 +67,16 @@ func classSource() (func(string) (catalog.Class, bool), string) {
 	return compiledClassOf, "compiled-in catalog"
 }
 
+// GenericIntent is the reserved prefix of the GENERIC fallback Evaluator
+// adapter: always judgment, never in the compiled-in intent catalog.
+const GenericIntent = "GENERIC"
+
 // compiledClassOf resolves the live catalog's *_GENERAL IDs to their original
 // intent's compiled-in class; a loaded intent_classes table is never overridden.
 func compiledClassOf(intent string) (catalog.Class, bool) {
+	if intent == GenericIntent {
+		return catalog.ClassJudgment, true
+	}
 	if c, ok := catalog.CompiledClassOf(intent); ok {
 		return c, ok
 	}
