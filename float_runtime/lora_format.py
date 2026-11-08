@@ -88,7 +88,7 @@ def metadata(*, cls: str, intent: str, foundation_hash: str, foundation_version:
 def write_package(path, meta: dict[str, str], tensors: dict) -> bytes:
     """Write {name: float32 numpy array} with meta as a safetensors file; returns its bytes."""
     import numpy as np
-    from safetensors.numpy import save, save_file
+    from safetensors.numpy import save
     clean = {}
     for name, arr in tensors.items():
         a = np.ascontiguousarray(arr, dtype=np.float32)
@@ -102,7 +102,10 @@ def write_package(path, meta: dict[str, str], tensors: dict) -> bytes:
     if len(data) > MAX_PACKAGE_BYTES:
         raise ValueError(f"package is {len(data)} bytes, above the {MAX_PACKAGE_BYTES} cap")
     if path is not None:
-        save_file(clean, str(path), metadata=meta)
+        # Write the same bytes we return, so a hash logged from `data` matches the file.
+        # Serialising a second time with save_file gave a file that differed byte for byte.
+        with open(path, "wb") as f:
+            f.write(data)
     return data
 
 

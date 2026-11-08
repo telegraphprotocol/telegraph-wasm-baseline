@@ -835,7 +835,7 @@ def main(argv=None) -> int:
     print("\nNext (shared Foundation Model, safetensors delta package):\n"
           f"  python -m float_runtime.export_adapter --run {out.as_posix()} --intent {args.intent} "
           f"--class <judgment|hybrid> --foundation <foundation.json>{max_tokens}\n"
-          f"  go run ./cmd/adapterbuild lora --intent {args.intent} --package {pkg} "
+          f"  go run ./cmd/adapterbuild lora --intent {args.intent} --package {deltapkg} "
           f"--foundation <foundation.json> --out {out.as_posix()}")
     return 0
 
